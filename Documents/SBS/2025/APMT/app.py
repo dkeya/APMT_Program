@@ -1,12 +1,7 @@
-# apmt_dashboard.py
-# Streamlit dashboard for APMT - Best-in-class, role-aware, auto-ingest, with rich KPIs
-# Usage: streamlit run apmt_dashboard.py  (expects APMT_data.xlsx/csv in same folder)
-# -------------------------------------------------------------------
-
 from __future__ import annotations
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -132,6 +127,9 @@ RCSI_15 = "15. Did your household reduce the number of meals eaten in a day?"
 RCSI_I6 = "I6. Did adults in your household restrict their consumption so that small children could eat?"
 WORRY = "I1. In the past 30 days, did you worry that your household would not have enough food?"
 
+# ---- rCSI band order (centralized) ----
+RCSI_ORDER = ["Minimal", "Stress", "Crisis", "Emergency", "Catastrophic"]
+
 # Adaptation (J)
 ADAPT_ANY = "J1. Have you made any adaptation measures last month due to drought  shocks?"
 J2_MULTI = "J2. Which adapatations measures are you using?"
@@ -217,7 +215,6 @@ def _apply_header_aliases(df: pd.DataFrame) -> pd.DataFrame:
     Trim/normalize spacing, then map explicit aliases -> canonical names.
     Tight and reviewable: only the entries above.
     """
-    # trim whitespace/NBSP across headers
     clean_cols = []
     for c in df.columns:
         cc = str(c).replace("\xa0", " ")
@@ -225,7 +222,6 @@ def _apply_header_aliases(df: pd.DataFrame) -> pd.DataFrame:
         clean_cols.append(cc)
     df.columns = clean_cols
 
-    # explicit alias map
     rename_map = {}
     current = set(df.columns)
     for canonical, variants in _HEADER_ALIASES.items():
@@ -246,6 +242,13 @@ def _validate_required(df: pd.DataFrame):
             "Missing required columns: " + ", ".join(missing)
             + ". Please ensure your file uses the canonical headers."
         )
+
+# ---- Named waves (explicit) ----
+WAVE_LABELS = [
+    ("Baseline", "2025-06-01", "2025-07-31"),
+    ("Midline",  "2025-08-01", "2025-09-30"),
+    ("Endline",  "2025-10-01", "2025-12-31"),
+]
 
 @st.cache_data(show_spinner=False)
 def load_data() -> pd.DataFrame:
@@ -277,9 +280,29 @@ def load_data() -> pd.DataFrame:
     if DATE_COL in df.columns:
         df["int_date_parsed"] = pd.to_datetime(
             df[DATE_COL].astype(str).str.replace(" ", "T", regex=False),
-            errors="coerce"
+            errors="coerce",
+            utc=False,  # we will just remove any tz below
         )
-        df["wave_month"] = df["int_date_parsed"].dt.to_period("M").astype(str)
+        # If tz-aware, strip timezone to make tz-naive
+        try:
+            if getattr(df["int_date_parsed"].dt, "tz", None) is not None:
+                df["int_date_parsed"] = df["int_date_parsed"].dt.tz_localize(None)
+        except Exception:
+            pass
+
+    # Month string (still fine with tz removed)
+    df["wave_month"] = df["int_date_parsed"].dt.to_period("M").astype(str)
+
+    # Named wave labels (safe now that int_date_parsed is tz-naive)
+    def _wave_name(d):
+        if pd.isna(d):
+            return None
+        for name, start, end in WAVE_LABELS:
+            if pd.to_datetime(start) <= d <= pd.to_datetime(end):
+                return name
+        return "Unlabeled"
+
+    df["wave_label"] = df["int_date_parsed"].apply(_wave_name)
 
     # Coerce numeric fields actually used later
     num_cols = [
@@ -343,7 +366,7 @@ def compute_rcsi(df: pd.DataFrame) -> pd.DataFrame:
     )
     df["rCSI_band"] = pd.cut(
         df["rCSI"], bins=[-0.1, 3, 9, 18, 30, 1000],
-        labels=["Minimal", "Stress", "Crisis", "Emergency", "Catastrophic"]
+        labels=RCSI_ORDER
     )
     return df
 
@@ -428,11 +451,19 @@ df = compute_finance(df)
 
 st.sidebar.title("Filters")
 
-role = st.sidebar.selectbox(
-    "View as",
-    options=["Program Manager", "Field Officer", "Donor"],
-    help="Switch presets and layout for different stakeholders."
+# Ruminant Focus (keep label exactly as requested: All / Sheep / Goat)
+species_focus = st.sidebar.selectbox(
+    "Ruminant Focus",
+    options=["All", "Sheep", "Goat"],
+    index=0,
+    help="Scope ownership, herd events, sales, and revenue to a specific ruminant. Health/finance/rCSI/maps/exports remain global."
 )
+_focus = "Sheep" if species_focus == "Sheep" else "Goat" if species_focus == "Goat" else "All"
+
+# Optional toggles (incrementals)
+gender_split = st.sidebar.checkbox("Disaggregate some charts by Gender", value=False)
+color_hotspots = st.sidebar.checkbox("Color map by treated cases (last month)", value=False)
+market_split = st.sidebar.checkbox("Split Markets & Sales by KPMD registration", value=False)
 
 # Ensure filter columns exist
 for _col in [COUNTY_COL, SUBCOUNTY_COL]:
@@ -440,10 +471,24 @@ for _col in [COUNTY_COL, SUBCOUNTY_COL]:
         df[_col] = np.nan
 
 counties = sorted([c for c in df[COUNTY_COL].dropna().unique().tolist() if c])
-sel_counties = st.sidebar.multiselect("County", options=counties, default=counties)
+
+# Collapsed multiselects via popover for County & Sub-county
+with st.sidebar.popover("County"):
+    sel_counties = st.multiselect(
+        "County",
+        options=counties,
+        default=counties,
+        label_visibility="collapsed",
+    )
 
 sub_options = sorted(df.loc[df[COUNTY_COL].isin(sel_counties), SUBCOUNTY_COL].dropna().unique().tolist())
-sel_subcounties = st.sidebar.multiselect("Sub-county", options=sub_options, default=sub_options)
+with st.sidebar.popover("Sub-county"):
+    sel_subcounties = st.multiselect(
+        "Sub-county",
+        options=sub_options,
+        default=sub_options,
+        label_visibility="collapsed",
+    )
 
 # Date range
 if "int_date_parsed" in df.columns:
@@ -469,33 +514,97 @@ if kpm_reg_filter != "All" and KPMD_REG in df.columns:
 dff = df.loc[mask].copy()
 households = dff[HH_ID_COL].nunique() if HH_ID_COL in dff.columns else dff.shape[0]
 
+# Helper: apply species scope (no changes to ingestion or other logic)
+def _scope_cols(d: pd.DataFrame, focus: str) -> pd.DataFrame:
+    d = d.copy()
+
+    # Always return a numeric Series aligned to d.index (never a raw int)
+    def s(col: str) -> pd.Series:
+        return _safe_num_series(d, col).fillna(0)
+
+    if focus == "Sheep":
+        d["owned_scoped"]      = s("sheep_owned")
+        d["births_scoped"]     = s(R_BORN) + s(E_BORN)
+        d["deaths_scoped"]     = s(R_DIED) + s(E_DIED)
+        d["loss_scoped"]       = s(R_LOST) + s(E_LOST)
+        d["slaughter_scoped"]  = s(R_SLAUGHT) + s(E_SLAUGHT)
+        d["sold_scoped"]       = s("sheep_sold_kpmd") + s("sheep_sold_non")
+        d["rev_scoped"]        = s("rev_sheep_kpmd") + s("rev_sheep_non")
+        d["transport_scoped"]  = s(S_TRANS_KPMD) * s(S_N_KPMD) + s(S_TRANS_NON) * s(S_N_NON)
+        d["owned_label"]       = "Sheep owned (median)"
+
+    elif focus == "Goat":
+        d["owned_scoped"]      = s("goats_owned")
+        d["births_scoped"]     = s(B_BORN) + s(D_BORN)
+        d["deaths_scoped"]     = s(B_DIED) + s(D_DIED)
+        d["loss_scoped"]       = s(B_LOST) + s(D_LOST)
+        d["slaughter_scoped"]  = s(B_SLAUGHT) + s(D_SLAUGHT)
+        d["sold_scoped"]       = s("goat_sold_kpmd") + s("goat_sold_non")
+        d["rev_scoped"]        = s("rev_goat_kpmd") + s("rev_goat_non")
+        d["transport_scoped"]  = s(G_TRANS_KPMD) * s(G_N_KPMD) + s(G_TRANS_NON) * s(G_N_NON)
+        d["owned_label"]       = "Goats owned (median)"
+
+    else:
+        # All (global totals)
+        d["owned_scoped"]      = s("sr_total_owned")
+        d["births_scoped"]     = s("births_total")
+        d["deaths_scoped"]     = s("deaths_total")
+        d["loss_scoped"]       = s("loss_total")
+        d["slaughter_scoped"]  = s("slaughter_total")
+        d["sold_scoped"]       = s("animals_sold_total")
+        d["rev_scoped"]        = s("rev_total")
+        d["transport_scoped"]  = s("transport_cost_total")
+        d["owned_label"]       = "Animals owned (median)"
+
+    d["net_change_scoped"] = d["births_scoped"] - (d["deaths_scoped"] + d["loss_scoped"] + d["slaughter_scoped"])
+    return d
+
+dff_scoped = _scope_cols(dff, _focus)
+
 # =========================================================
 # ---------------------- HEADER KPIs ----------------------
 # =========================================================
 
 st.title("APMT Program Insights")
-st.caption("Strathmore Agri-Food Innovation Center • Longitudinal livestock/feeds, outgrowing & market outcomes")
+st.caption("Longitudinal panel insights on small-ruminant ownership, health, market participation, and resilience across Kajiado, Samburu, and Narok")
 
 col_a, col_b, col_c, col_d, col_e = st.columns(5)
 with col_a:
     st.metric("Households (filtered)", f"{households:,}")
 with col_b:
-    owned_med_int = _fmt_median_int(dff["sr_total_owned"]) if "sr_total_owned" in dff else 0
-    st.metric("Animals owned (median)", f"{owned_med_int}")
+    owned_med_int = _fmt_median_int(dff_scoped["owned_scoped"]) if "owned_scoped" in dff_scoped else 0
+    owned_label = (dff_scoped["owned_label"].iloc[0] if ("owned_label" in dff_scoped and not dff_scoped.empty)
+                   else "Animals owned (median)")
+    st.metric(owned_label, f"{owned_med_int}")
 with col_c:
     vacc_rate = (dff[VACC_ANY + "_bool"].mean()*100) if VACC_ANY + "_bool" in dff else 0
     st.metric("Vaccinated in last month", f"{vacc_rate:0.1f}%")
 with col_d:
-    sold_any = (dff["animals_sold_total"] > 0).mean()*100 if "animals_sold_total" in dff else 0
+    sold_any = (dff_scoped["sold_scoped"] > 0).mean()*100 if "sold_scoped" in dff_scoped else 0
     st.metric("Sold animals (any channel)", f"{sold_any:0.1f}%")
 with col_e:
     rcsi_mean = dff["rCSI"].mean() if "rCSI" in dff and len(dff["rCSI"].dropna()) else np.nan
     st.metric("Avg rCSI", f"{rcsi_mean:.1f}" if pd.notna(rcsi_mean) else "—")
 
+# ---- Incremental: % female stock KPIs (global) ----
+col_f1, col_f2 = st.columns(2)
+with col_f1:
+    if "sheep_owned" in dff.columns and SHEEP_EWES in dff.columns:
+        denom = dff["sheep_owned"].replace({0: np.nan}).sum()
+        if pd.notna(denom) and denom > 0:
+            sheep_female_share = (dff[SHEEP_EWES].sum() / denom) * 100
+            st.metric("Sheep: % female", f"{sheep_female_share:0.1f}%")
+with col_f2:
+    if "goats_owned" in dff.columns and GOAT_DOES in dff.columns:
+        denom = dff["goats_owned"].replace({0: np.nan}).sum()
+        if pd.notna(denom) and denom > 0:
+            goat_female_share = (dff[GOAT_DOES].sum() / denom) * 100
+            st.metric("Goats: % female", f"{goat_female_share:0.1f}%")
+
 st.divider()
 
 # =========================================================
-# ---------------------- ROLE LAYOUTS ---------------------
+# ---------------------- VISUAL SECTIONS ------------------
 # =========================================================
 
 def section_header(title: str, help_text: str = ""):
@@ -515,41 +624,49 @@ def vbar(df_in, x, y, color=None, title="", tooltip=None):
 def line(df_in, x, y, color=None, title="", tooltip=None):
     if tooltip is None:
         tooltip = [x, y] + ([color] if color else [])
-
-    enc = {
-        "x": alt.X(x),
-        "y": alt.Y(y),
-        "tooltip": tooltip,
-    }
+    enc = {"x": alt.X(x), "y": alt.Y(y), "tooltip": tooltip}
     if color:
         enc["color"] = color
-
     chart = alt.Chart(df_in).mark_line(point=True).encode(**enc)\
         .properties(height=320, title=title)
-
     st.altair_chart(chart, use_container_width=True)
 
 # ---------- Common sections (shown to all) ----------
 
-# 1) Herd dynamics
+# 1) Herd dynamics (scoped by Ruminant Focus)
 section_header("Herd Dynamics", "Ownership, births/deaths/losses, net change, water access")
 c1, c2, c3 = st.columns([1,1,1])
 
 with c1:
-    if not dff.empty:
-        by_geo = dff.groupby([COUNTY_COL])[["sheep_owned","goats_owned","sr_total_owned"]].median(numeric_only=True).reset_index()
-        if not by_geo.empty:
-            vbar(by_geo, x=COUNTY_COL, y="sr_total_owned", title="Median Small Ruminants Owned by County")
+    if not dff_scoped.empty:
+        if gender_split and GENDER_COL in dff_scoped.columns and dff_scoped[GENDER_COL].notna().any():
+            by_geo = (
+                dff_scoped.dropna(subset=[GENDER_COL])
+                .groupby([COUNTY_COL, GENDER_COL])[["owned_scoped"]]
+                .median(numeric_only=True)
+                .reset_index()
+                .rename(columns={"owned_scoped": "owned"})
+            )
+            title = (dff_scoped["owned_label"].iloc[0] if "owned_label" in dff_scoped and not dff_scoped.empty
+                     else "Animals owned (median)")
+            vbar(by_geo, x=COUNTY_COL, y="owned", color=GENDER_COL, title=f"{title} by County (by Gender)")
+        else:
+            by_geo = dff_scoped.groupby([COUNTY_COL])[["owned_scoped"]].median(numeric_only=True).reset_index()
+            if not by_geo.empty:
+                title = (dff_scoped["owned_label"].iloc[0] if "owned_label" in dff_scoped and not dff_scoped.empty
+                         else "Animals owned (median)")
+                vbar(by_geo.rename(columns={"owned_scoped": "owned"}), x=COUNTY_COL, y="owned", title=title)
 
 with c2:
-    dff["net_change_reported"] = dff.get("net_change_reported", 0)
-    by_geo2 = dff.groupby([COUNTY_COL])[["births_total","deaths_total","loss_total","slaughter_total","net_change_reported"]] \
-                 .median(numeric_only=True).reset_index()
+    dff_scoped["net_change_scoped"] = dff_scoped.get("net_change_scoped", 0)
+    by_geo2 = dff_scoped.groupby([COUNTY_COL])[["births_scoped","deaths_scoped","loss_scoped","slaughter_scoped","net_change_scoped"]] \
+                        .median(numeric_only=True).reset_index()
     if not by_geo2.empty:
         hm = by_geo2.melt(id_vars=[COUNTY_COL], var_name="event", value_name="count")
         vbar(hm, x="event", y="count", color="County", title="Median monthly herd events (by County)")
 
 with c3:
+    # Water access remains global (not species-scoped)
     if WATER_ACCESS in dff.columns:
         water_rate = dff[WATER_ACCESS + "_bool"].mean()*100 if WATER_ACCESS + "_bool" in dff else \
                      yes_no_to_bool(dff[WATER_ACCESS]).mean()*100
@@ -561,7 +678,13 @@ with c3:
         )
         vbar(gender_m, x="group", y="share", color="County", title="Median control share by gender (County)")
 
-# 2) Animal health
+# ---- Incremental: KPMD split for scoped births (example) ----
+if KPMD_REG in dff.columns and "births_scoped" in dff_scoped.columns and "wave_month" in dff_scoped.columns:
+    births_kpmd = dff_scoped.groupby(["wave_month", KPMD_REG])["births_scoped"].median().reset_index()
+    section_header("KPMD Split (Scoped Metric)", "Median births by month, split by KPMD registration")
+    line(births_kpmd, x="wave_month", y="births_scoped", color=KPMD_REG, title="Births (median) by KPMD status")
+
+# 2) Animal health (global)
 section_header("Animal Health", "Vaccination, treatment, deworming and diseases (last month)")
 h1, h2, h3 = st.columns(3)
 with h1:
@@ -581,34 +704,115 @@ with h3:
     if TREAT_COUNT in dff:
         st.metric("Treated animals (median)", f"{_fmt_median_int(dff[TREAT_COUNT])}")
 
-# 3) Markets & sales
+# 3) Markets & sales (scoped)
 section_header("Markets & Sales", "Sales to KPMD vs non-KPMD, revenue, transport, distance, KPMD exposure")
 m1, m2, m3 = st.columns(3)
+
+def _sales_split_by_kpmd_for_focus(dff_scoped: pd.DataFrame, focus: str) -> pd.DataFrame:
+    """Return dataframe with totals split by KPMD registration for current focus."""
+    if KPMD_REG not in dff_scoped.columns:
+        return pd.DataFrame()
+    if focus == "All":
+        sheep = (dff_scoped["sheep_sold_kpmd"] + dff_scoped["sheep_sold_non"]).groupby(dff_scoped[KPMD_REG]).sum()
+        goat  = (dff_scoped["goat_sold_kpmd"]  + dff_scoped["goat_sold_non"]).groupby(dff_scoped[KPMD_REG]).sum()
+        out = [{"species": "Sheep", KPMD_REG: k, "count": v} for k, v in sheep.items()] + \
+              [{"species": "Goat",  KPMD_REG: k, "count": v} for k, v in goat.items()]
+        return pd.DataFrame(out)
+    else:
+        return dff_scoped.groupby(KPMD_REG)["sold_scoped"].sum().reset_index().rename(columns={"sold_scoped": "count"})
+
+def _revenue_split_by_kpmd_for_focus(dff_scoped: pd.DataFrame, focus: str) -> pd.DataFrame:
+    if KPMD_REG not in dff_scoped.columns:
+        return pd.DataFrame()
+    if focus == "All":
+        out = []
+        for sp, col in [("Sheep", ["rev_sheep_kpmd","rev_sheep_non"]),
+                        ("Goat",  ["rev_goat_kpmd","rev_goat_non"])]:
+            ser = (dff_scoped[col[0]] + dff_scoped[col[1]]).groupby(dff_scoped[KPMD_REG]).sum()
+            out += [{"species": sp, KPMD_REG: k, "revenue_ksh": v} for k, v in ser.items()]
+        return pd.DataFrame(out)
+    else:
+        return dff_scoped.groupby(KPMD_REG)["rev_scoped"].sum().reset_index().rename(columns={"rev_scoped": "revenue_ksh"})
+
 with m1:
-    sales = pd.DataFrame({
-        "channel": ["KPMD","KPMD","Non-KPMD","Non-KPMD"],
-        "species": ["Sheep","Goat","Sheep","Goat"],
-        "count": [
-            dff.get("sheep_sold_kpmd", pd.Series([], dtype=float)).sum(),
-            dff.get("goat_sold_kpmd",  pd.Series([], dtype=float)).sum(),
-            dff.get("sheep_sold_non",  pd.Series([], dtype=float)).sum(),
-            dff.get("goat_sold_non",   pd.Series([], dtype=float)).sum(),
-        ]
-    })
-    vbar(sales, x="species", y="count", color="channel", title="Animals sold (count)")
+    if market_split and KPMD_REG in dff_scoped.columns:
+        if _focus == "All":
+            sales = _sales_split_by_kpmd_for_focus(dff_scoped, _focus)
+            vbar(sales, x="species", y="count", color=KPMD_REG, title="Animals sold (count) by KPMD registration")
+        else:
+            sales = _sales_split_by_kpmd_for_focus(dff_scoped, _focus)
+            vbar(sales, x=KPMD_REG, y="count", title=f"{_focus} sold (count) by KPMD registration")
+    else:
+        if _focus == "All":
+            sales = pd.DataFrame({
+                "channel": ["KPMD","KPMD","Non-KPMD","Non-KPMD"],
+                "species": ["Sheep","Goat","Sheep","Goat"],
+                "count": [
+                    dff.get("sheep_sold_kpmd", pd.Series([], dtype=float)).sum(),
+                    dff.get("goat_sold_kpmd",  pd.Series([], dtype=float)).sum(),
+                    dff.get("sheep_sold_non",  pd.Series([], dtype=float)).sum(),
+                    dff.get("goat_sold_non",   pd.Series([], dtype=float)).sum(),
+                ]
+            })
+            vbar(sales, x="species", y="count", color="channel", title="Animals sold (count)")
+        elif _focus == "Sheep":
+            sales = pd.DataFrame({
+                "channel": ["KPMD","Non-KPMD"],
+                "count": [
+                    dff.get("sheep_sold_kpmd", pd.Series([], dtype=float)).sum(),
+                    dff.get("sheep_sold_non",  pd.Series([], dtype=float)).sum(),
+                ]
+            })
+            vbar(sales, x="channel", y="count", title="Sheep sold (count)")
+        else:  # Goat
+            sales = pd.DataFrame({
+                "channel": ["KPMD","Non-KPMD"],
+                "count": [
+                    dff.get("goat_sold_kpmd", pd.Series([], dtype=float)).sum(),
+                    dff.get("goat_sold_non",  pd.Series([], dtype=float)).sum(),
+                ]
+            })
+            vbar(sales, x="channel", y="count", title="Goats sold (count)")
 
 with m2:
-    rev = pd.DataFrame({
-        "channel": ["KPMD","KPMD","Non-KPMD","Non-KPMD"],
-        "species": ["Sheep","Goat","Sheep","Goat"],
-        "revenue_ksh": [
-            dff.get("rev_sheep_kpmd", pd.Series([], dtype=float)).sum(),
-            dff.get("rev_goat_kpmd",  pd.Series([], dtype=float)).sum(),
-            dff.get("rev_sheep_non",  pd.Series([], dtype=float)).sum(),
-            dff.get("rev_goat_non",   pd.Series([], dtype=float)).sum(),
-        ]
-    })
-    vbar(rev, x="species", y="revenue_ksh", color="channel", title="Revenue (KSh)")
+    if market_split and KPMD_REG in dff_scoped.columns:
+        if _focus == "All":
+            rev = _revenue_split_by_kpmd_for_focus(dff_scoped, _focus)
+            vbar(rev, x="species", y="revenue_ksh", color=KPMD_REG, title="Revenue (KSh) by KPMD registration")
+        else:
+            rev = _revenue_split_by_kpmd_for_focus(dff_scoped, _focus)
+            vbar(rev, x=KPMD_REG, y="revenue_ksh", title=f"Revenue (KSh) — {_focus} by KPMD registration")
+    else:
+        if _focus == "All":
+            rev = pd.DataFrame({
+                "channel": ["KPMD","KPMD","Non-KPMD","Non-KPMD"],
+                "species": ["Sheep","Goat","Sheep","Goat"],
+                "revenue_ksh": [
+                    dff.get("rev_sheep_kpmd", pd.Series([], dtype=float)).sum(),
+                    dff.get("rev_goat_kpmd",  pd.Series([], dtype=float)).sum(),
+                    dff.get("rev_sheep_non",  pd.Series([], dtype=float)).sum(),
+                    dff.get("rev_goat_non",   pd.Series([], dtype=float)).sum(),
+                ]
+            })
+            vbar(rev, x="species", y="revenue_ksh", color="channel", title="Revenue (KSh)")
+        elif _focus == "Sheep":
+            rev = pd.DataFrame({
+                "channel": ["KPMD","Non-KPMD"],
+                "revenue_ksh": [
+                    dff.get("rev_sheep_kpmd", pd.Series([], dtype=float)).sum(),
+                    dff.get("rev_sheep_non",  pd.Series([], dtype=float)).sum(),
+                ]
+            })
+            vbar(rev, x="channel", y="revenue_ksh", title="Revenue (KSh) — Sheep")
+        else:
+            rev = pd.DataFrame({
+                "channel": ["KPMD","Non-KPMD"],
+                "revenue_ksh": [
+                    dff.get("rev_goat_kpmd", pd.Series([], dtype=float)).sum(),
+                    dff.get("rev_goat_non",  pd.Series([], dtype=float)).sum(),
+                ]
+            })
+            vbar(rev, x="channel", y="revenue_ksh", title="Revenue (KSh) — Goats")
 
 with m3:
     km = dff[DIST_KM].dropna() if DIST_KM in dff else pd.Series([], dtype=float)
@@ -618,7 +822,7 @@ with m3:
         exp = dff.groupby(KPMD_REG)[HH_ID_COL].nunique().reset_index().rename(columns={HH_ID_COL:"households"})
         vbar(exp, x=KPMD_REG, y="households", title="Households by KPMD registration")
 
-# 4) Gender decision & control
+# 4) Gender decision & control (global)
 section_header("Gender Decision & Use of Income", "Share of decision makers and income controllers")
 g1, g2 = st.columns(2)
 if G1_MULTI in dff and G2_MULTI in dff:
@@ -637,19 +841,29 @@ if G1_MULTI in dff and G2_MULTI in dff:
     g2_df.columns = ["role","count"]
     vbar(g2_df, x="role", y="count", title="Who uses income from sales?")
 
-# 5) Food security (rCSI)
+# 5) Food security (rCSI) — global
 section_header("Food Security (rCSI)", "Reduced Coping Strategies Index (higher = worse)")
 fs1, fs2 = st.columns(2)
 with fs1:
     if "rCSI" in dff and not dff.empty:
-        by_c = dff.groupby(COUNTY_COL)["rCSI"].median().reset_index()
-        vbar(by_c, x=COUNTY_COL, y="rCSI", title="Median rCSI by County")
+        if gender_split and GENDER_COL in dff.columns and dff[GENDER_COL].notna().any():
+            tmp = dff.dropna(subset=[GENDER_COL]).groupby([COUNTY_COL, GENDER_COL])["rCSI"].median().reset_index()
+            vbar(tmp, x=COUNTY_COL, y="rCSI", color=GENDER_COL, title="Median rCSI by County (by Gender)")
+        else:
+            by_c = dff.groupby(COUNTY_COL)["rCSI"].median().reset_index()
+            vbar(by_c, x=COUNTY_COL, y="rCSI", title="Median rCSI by County")
 with fs2:
+    # Safer rCSI band ordering (Minimal -> Catastrophic)
     if "rCSI_band" in dff:
-        bands = dff["rCSI_band"].value_counts(dropna=False).rename_axis("band").reset_index(name="households")
+        bands = (dff["rCSI_band"]
+                 .astype("category")
+                 .cat.set_categories(RCSI_ORDER, ordered=True)
+                 .value_counts(dropna=False)
+                 .rename_axis("band")
+                 .reset_index(name="households"))
         vbar(bands, x="band", y="households", title="rCSI bands (count)")
 
-# 6) Credit & Insurance
+# 6) Credit & Insurance — global
 section_header("Finance & Insurance", "Credit access and livestock insurance (last 30 days)")
 fi1, fi2, fi3 = st.columns(3)
 with fi1:
@@ -667,7 +881,7 @@ with fi3:
     if INS_PREMIUM in dff:
         st.metric("Premium (median KSh)", f"{_fmt_median_int(dff[INS_PREMIUM])}")
 
-# 7) Adaptation strategies
+# 7) Adaptation strategies — global
 section_header("Adaptation to Shocks", "Adopted strategies last month")
 if J2_MULTI in dff:
     j2_counts = {}
@@ -677,18 +891,60 @@ if J2_MULTI in dff:
     j2_df = pd.DataFrame({"strategy": list(j2_counts.keys()), "households": list(j2_counts.values())})
     vbar(j2_df, x="strategy", y="households", title="Adopted strategies")
 
-# 8) Map (GPS)
+# ---- Incremental: Resilience grouping + trend ----
+ADAPTIVE = {
+    "Increased mobility (distance & frequency)",
+    "Purchase of fodder",
+    "Change in water management",
+    "Use stored fodder",
+    "Herd destocking and restocking",
+}
+EROSIVE = {"Reduce herd size", "Banking livestock assets (sell and bank saving)"}
+
+if "wave_month" in dff.columns and J2_MULTI in dff.columns:
+    s_ad = dff[J2_MULTI].astype(str).fillna("")
+    df_ad = pd.DataFrame({
+        "adaptive": s_ad.str.contains("|".join(map(re.escape, ADAPTIVE)), case=False, na=False),
+        "erosive":  s_ad.str.contains("|".join(map(re.escape, EROSIVE)),  case=False, na=False),
+        "wave_month": dff["wave_month"]
+    })
+    trend_ad = df_ad.groupby("wave_month")[["adaptive","erosive"]].mean().reset_index().melt(
+        id_vars="wave_month", var_name="type", value_name="share"
+    )
+    section_header("Adaptation Trends", "Share of households adopting adaptive vs erosive strategies")
+    line(trend_ad, x="wave_month", y="share", color="type", title="Adaptation shares over time")
+
+# 8) Map (GPS) — global
 section_header("Map of Respondents", "Locations based on captured GPS")
 if GPS_LAT_COL in dff and GPS_LON_COL in dff:
     geo = dff[[GPS_LAT_COL, GPS_LON_COL, COUNTY_COL, SUBCOUNTY_COL]].dropna().copy()
     geo = geo.rename(columns={GPS_LAT_COL:"lat", GPS_LON_COL:"lon"})
     if not geo.empty:
+        # Robust hotspot coloring: precompute color columns
+        if color_hotspots and TREAT_COUNT in dff.columns:
+            geo["treated"] = dff.loc[geo.index, TREAT_COUNT].fillna(0).astype(float)
+            geo["color_r"] = np.minimum(255, (geo["treated"] * 10).astype(int))
+            layers = [pdk.Layer(
+                "ScatterplotLayer",
+                data=geo,
+                get_position='[lon, lat]',
+                get_radius=2000,
+                pickable=True,
+                get_fill_color='[color_r, 0, 0, 160]',
+            )]
+        else:
+            layers = [pdk.Layer(
+                "ScatterplotLayer", data=geo,
+                get_position='[lon, lat]',
+                get_radius=2000, pickable=True
+            )]
+
         st.pydeck_chart(pdk.Deck(
             map_style="mapbox://styles/mapbox/light-v9",
             initial_view_state=pdk.ViewState(
                 latitude=geo["lat"].mean(), longitude=geo["lon"].mean(), zoom=6, pitch=0
             ),
-            layers=[pdk.Layer("ScatterplotLayer", data=geo, get_position='[lon, lat]', get_radius=2000, pickable=True)],
+            layers=layers,
             tooltip={"text": "{County}\n{Sub county}"}
         ))
     else:
@@ -700,26 +956,106 @@ if GPS_LAT_COL in dff and GPS_LON_COL in dff:
 
 section_header("Longitudinal Trends", "Follow households across waves / months (panel views)")
 if "wave_month" in dff and HH_ID_COL in dff:
+
+    # ---- Incremental: Monthly submissions volume (global) ----
+    sub_counts = dff.groupby("wave_month").size().reset_index(name="submissions")
+    if not sub_counts.empty:
+        vbar(sub_counts, x="wave_month", y="submissions", title="Submitted records per month")
+
+    if _focus == "All":
+        trend_options = [
+            ("sr_total_owned", "Animals owned (median)"),
+            ("births_total", "Births (median)"),
+            ("deaths_total", "Deaths (median)"),
+            ("animals_sold_total", "Animals sold (median)"),
+            ("rev_total", "Revenue (median KSh)"),
+            ("transport_cost_total", "Transport cost (median KSh)"),
+            ("rCSI", "rCSI (median)"),
+        ]
+    else:
+        trend_options = [
+            ("owned_scoped", "Owned (median)"),
+            ("births_scoped", "Births (median)"),
+            ("deaths_scoped", "Deaths (median)"),
+            ("sold_scoped", "Animals sold (median)"),
+            ("rev_scoped", "Revenue (median KSh)"),
+            ("transport_scoped", "Transport cost (median KSh)"),
+            ("rCSI", "rCSI (median)"),  # rCSI is global but can be trended
+        ]
+
+    metric_keys = [k for k, _ in trend_options]
+    labels = {k: lbl for k, lbl in trend_options}
+
     choice_metric = st.selectbox(
         "Metric to trend by month",
-        options=["sr_total_owned","births_total","deaths_total","animals_sold_total","rev_total","transport_cost_total","rCSI"],
-        index=0
+        options=metric_keys,
+        index=0,
+        format_func=lambda k: labels.get(k, k)
     )
-    trend = dff.groupby(["wave_month"])[choice_metric].median(numeric_only=True).reset_index()
-    if not trend.empty:
-        line(trend, x="wave_month", y=choice_metric, title=f"Median {choice_metric} over time")
 
+    # Choose the right dataframe for the selected metric
+    source_df = dff_scoped if choice_metric in [
+        "owned_scoped","births_scoped","deaths_scoped","sold_scoped","rev_scoped","transport_scoped"
+    ] else dff
+
+    trend = source_df.groupby(["wave_month"])[choice_metric].median(numeric_only=True).reset_index()
+    if not trend.empty:
+        line(trend, x="wave_month", y=choice_metric, title=f"Median {labels.get(choice_metric, choice_metric)} over time")
+
+    # -------- Household panel (scoped + global) --------
+    panel_base_cols = ["int_date_parsed", "wave_month"]
+    if "wave_label" in dff.columns:
+        panel_base_cols.append("wave_label")
+
+    global_cols = []
+    if "rCSI" in dff.columns: global_cols.append("rCSI")
+    if "men_control_share" in dff.columns: global_cols.append("men_control_share")
+    if "women_control_share" in dff.columns: global_cols.append("women_control_share")
+
+    # Ensure panel has household id and geography (if present)
+    panel_extra_cols = []
+    if HH_ID_COL in dff.columns: panel_extra_cols.append(HH_ID_COL)
+    if COUNTY_COL in dff.columns: panel_extra_cols.append(COUNTY_COL)
+    if SUBCOUNTY_COL in dff.columns: panel_extra_cols.append(SUBCOUNTY_COL)
+
+    scoped_cols = ["owned_scoped","births_scoped","deaths_scoped","sold_scoped","rev_scoped","transport_scoped"]
+
+    # Merge global columns from dff to dff_scoped (safe on HH_ID + date)
+    join_keys = []
+    if HH_ID_COL in dff.columns: join_keys.append(HH_ID_COL)
+    if "int_date_parsed" in dff.columns: join_keys.append("int_date_parsed")
+
+    rhs_cols = list(set((join_keys or []) + global_cols))
+    rhs = dff[rhs_cols].copy() if rhs_cols else pd.DataFrame()
+
+    panel_df = dff_scoped.copy()
+    if rhs.shape[1] > 0 and len(join_keys) > 0:
+        panel_df = panel_df.merge(rhs, on=join_keys, how="left")
+
+    show_cols = [c for c in panel_extra_cols + panel_base_cols + scoped_cols + global_cols if c in panel_df.columns]
+
+    # Household selector (uses filtered set)
+    hh_options = sorted(dff[HH_ID_COL].dropna().unique().tolist()) if HH_ID_COL in dff else []
+    hh_default_index = 0 if hh_options else None
     hh_for_panel = st.selectbox(
         "Household to inspect (panel)",
-        options=sorted(dff[HH_ID_COL].dropna().unique().tolist()) if HH_ID_COL in dff else [],
-        index=0 if HH_ID_COL in dff and dff[HH_ID_COL].nunique()>0 else None
+        options=hh_options,
+        index=hh_default_index
     )
-    if hh_for_panel:
-        hh_panel = dff.loc[dff[HH_ID_COL]==hh_for_panel].sort_values("int_date_parsed")
-        st.dataframe(hh_panel[[
-            "int_date_parsed","sr_total_owned","births_total","deaths_total","animals_sold_total",
-            "rev_total","rCSI","men_control_share","women_control_share"
-        ]].reset_index(drop=True))
+
+    # ✅ Correct slicing with .loc[...] and a boolean mask
+    if hh_for_panel and HH_ID_COL in panel_df.columns:
+        hh_mask = panel_df[HH_ID_COL].astype(str).eq(str(hh_for_panel))
+        hh_panel = panel_df.loc[hh_mask]
+    else:
+        hh_panel = panel_df.iloc[0:0]  # empty fallback
+
+    # Keep sort & render
+    hh_panel = hh_panel.sort_values("int_date_parsed") if "int_date_parsed" in hh_panel.columns else hh_panel
+    if show_cols:
+        st.dataframe(hh_panel[show_cols].reset_index(drop=True))
+    else:
+        st.info("No panel columns available to display for the selected household.")
 
 # =========================================================
 # ------------------ DATA QUALITY CHECKS ------------------
@@ -763,46 +1099,42 @@ def to_csv_download(df_in: pd.DataFrame, name: str):
         use_container_width=True
     )
 
-# Filtered raw rows
+# Filtered raw rows (GLOBAL filter context, not species-sliced rows)
 to_csv_download(dff, "apmt_filtered_rows")
 
-# KPI snapshot (by county)
+# KPI snapshot — include wave_label if available (easier pivoting downstream)
 if not dff.empty:
     agg_dict = {
         "sr_total_owned":"median",
         "rCSI":"median",
         "rev_total":"sum",
     }
-    # Vaccination rate present?
     if VACC_ANY + "_bool" in dff:
         agg_dict[VACC_ANY + "_bool"] = "mean"
-    # Households unique if HH_ID exists else row count
+
+    group_cols = [COUNTY_COL]
+    if "wave_label" in dff.columns:
+        group_cols.append("wave_label")
+
     if HH_ID_COL in dff:
-        hh_series = dff.groupby(COUNTY_COL)[HH_ID_COL].nunique()
+        hh_series = dff.groupby(group_cols)[HH_ID_COL].nunique()
     else:
-        hh_series = dff.groupby(COUNTY_COL).size()
-    kpi_by_county = dff.groupby(COUNTY_COL).agg(agg_dict).rename(columns={
+        hh_series = dff.groupby(group_cols).size()
+
+    kpi_by = dff.groupby(group_cols).agg(agg_dict).rename(columns={
         "sr_total_owned":"sr_owned_med",
         "rCSI":"rCSI_med",
         "rev_total":"rev_sum",
         VACC_ANY + "_bool":"vacc_rate"
     }).reset_index()
-    kpi_by_county = kpi_by_county.merge(hh_series.rename("hh"), on=COUNTY_COL, how="left")
-    if "vacc_rate" in kpi_by_county.columns:
-        kpi_by_county["vacc_rate"] = kpi_by_county["vacc_rate"] * 100
-    to_csv_download(kpi_by_county, "apmt_kpi_by_county")
+
+    if isinstance(hh_series, pd.Series):
+        kpi_by = kpi_by.merge(hh_series.rename("hh"), on=group_cols, how="left")
+    if "vacc_rate" in kpi_by.columns:
+        kpi_by["vacc_rate"] = kpi_by["vacc_rate"] * 100
+
+    to_csv_download(kpi_by, "apmt_kpi")
 
 st.caption("Tip: keep your APMT file named **APMT_data.xlsx** (or **APMT_data.csv**) next to this app — it’s loaded automatically.")
-
-# =========================================================
-# ---------------------- ROLE TWEAKS ----------------------
-# =========================================================
-
-if role == "Donor":
-    st.info("Donor view: Focus on high-level outcomes — vaccination, sales volume and revenue, food security, and insurance coverage.")
-elif role == "Field Officer":
-    st.info("Field Officer view: Use county/sub-county filters, data-quality checks, and map to plan follow-ups.")
-else:
-    st.info("Program Manager view: Use longitudinal trends and KPI exports for reporting and prioritization.")
 
 # ------------------------ END ----------------------------
