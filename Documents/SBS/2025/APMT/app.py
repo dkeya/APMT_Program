@@ -1135,6 +1135,4 @@ if not dff.empty:
 
     to_csv_download(kpi_by, "apmt_kpi")
 
-st.caption("Tip: keep your APMT file named **APMT_data.xlsx** (or **APMT_data.csv**) next to this app — it’s loaded automatically.")
-
 # ------------------------ END ----------------------------
