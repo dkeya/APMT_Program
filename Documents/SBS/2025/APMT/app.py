@@ -8,6 +8,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import pydeck as pdk
 import re
+import io
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -1322,38 +1323,34 @@ def main():
     uploaded_file = st.file_uploader("Upload APMT Data CSV", type=['csv'])
     
     if uploaded_file is not None:
-        # Robust file loading with multiple encoding attempts
-        encodings_to_try = ['utf-8', 'latin-1', 'ISO-8859-1', 'cp1252', 'windows-1252']
-        
-        for encoding in encodings_to_try:
-            try:
-                uploaded_file.seek(0)  # Reset file pointer for each attempt
-                df = pd.read_csv(uploaded_file, encoding=encoding)
-                st.success(f"Data loaded successfully: {len(df)} records ({encoding} encoding)")
-                break
-            except UnicodeDecodeError:
-                continue
-            except Exception as e:
-                st.error(f"Error with {encoding} encoding: {str(e)}")
-                continue
-        else:
-            # If all encodings failed
-            st.error("Could not read the file with any common encoding.")
-            st.info("""
-            **Troubleshooting tips:**
-            1. Open the CSV in Excel and save as UTF-8 CSV
-            2. Check if the file is corrupted
-            3. Ensure it's a valid CSV file, not Excel (.xlsx)
-            """)
-            return
-        
-        # Show data preview
-        with st.expander("Data Preview"):
-            st.write(f"Columns: {list(df.columns)}")
-            st.write(f"Total records: {len(df)}")
-            st.dataframe(df.head())
-        
         try:
+            # Deployment-robust file loading
+            file_bytes = uploaded_file.getvalue()
+            
+            # Try multiple encodings
+            encodings = ['utf-8', 'latin-1', 'ISO-8859-1', 'cp1252', 'windows-1252']
+            df = None
+            
+            for encoding in encodings:
+                try:
+                    df = pd.read_csv(io.BytesIO(file_bytes), encoding=encoding)
+                    st.success(f"Data loaded successfully: {len(df)} records ({encoding} encoding)")
+                    break
+                except (UnicodeDecodeError, pd.errors.EmptyDataError):
+                    continue
+            
+            if df is None:
+                # Final attempt with error handling
+                df = pd.read_csv(io.BytesIO(file_bytes), encoding='utf-8', errors='replace')
+                st.success(f"Data loaded with character replacement: {len(df)} records")
+                st.warning("Some special characters were replaced due to encoding issues")
+            
+            # Show data preview
+            with st.expander("Data Preview"):
+                st.write(f"Columns: {list(df.columns)}")
+                st.write(f"Total records: {len(df)}")
+                st.dataframe(df.head())
+            
             # Initialize data processor and renderer
             processor = APMTDataProcessor(df)
             renderer = DashboardRenderer(processor)
@@ -1424,7 +1421,7 @@ def main():
             elif page == "Payments":
                 renderer.render_payments()
             elif page == "P&L Analysis":
-                renderer.render_pl_analysis()  # Make sure this method exists in your DashboardRenderer
+                renderer.render_pl_analysis()  # Make sure this method exists
             elif page == "County Comparator":
                 renderer.render_county_compare()
             elif page == "Gender Inclusion":
