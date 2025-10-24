@@ -1,4 +1,4 @@
-# app.py
+# app.py (complete with all rendering methods)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 # Configuration
 # -------------------------------------------------
 st.set_page_config(
-    page_title="APMT Longitudinal Dashboard",
+    page_title="APMT Project Insights",
     page_icon="🐑",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -56,6 +56,14 @@ st.markdown("""
     }
     .tab-container {
         margin-top: 1rem;
+    }
+    .profit-positive {
+        color: #28a745;
+        font-weight: bold;
+    }
+    .profit-negative {
+        color: #dc3545;
+        font-weight: bold;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -333,20 +341,27 @@ class APMTDataProcessor:
                     'total_births','total_mortality','total_losses',
                     'birth_rate_per_100','mortality_rate_per_100','loss_rate_per_100']:
                 if col not in self.df.columns:
-                    self.df[col] = 0
+                    self.df[col] = 0.0  # Use float to avoid integer issues
+
+            # Flexible herd composition detection - use your actual column names
+            sheep_cols = [
+                'C3. Number of Rams currently owned (total: at home + away + relatives/friends)',
+                'C3. Number of Ewes currently owned (total: at home + away + relatives/friends)'
+            ]
+            goat_cols = [
+                'C3. Number of Bucks currently owned (total: at home + away + relatives/friends)',
+                'C3. Number of Does currently owned (total: at home + away + relatives/friends)'
+            ]
         
-            # Flexible herd composition detection
-            sheep_cols = self.column_mapping['herd_sheep'] or []
-            goat_cols = self.column_mapping['herd_goats'] or []
-            birth_cols = self.column_mapping['births'] or []
-            mortality_cols = self.column_mapping['deaths'] or []
-            loss_cols = self.column_mapping['losses'] or []
+            # Filter to columns that actually exist in the data
+            sheep_cols = [col for col in sheep_cols if col in self.df.columns]
+            goat_cols = [col for col in goat_cols if col in self.df.columns]
         
             # Ensure numeric for all detected columns
-            all_herd_cols = sheep_cols + goat_cols + birth_cols + mortality_cols + loss_cols
+            all_herd_cols = sheep_cols + goat_cols
             for col in all_herd_cols:
                 self.df[col] = pd.to_numeric(self.df[col], errors='coerce').fillna(0)
-        
+
             # Calculate totals
             if sheep_cols:
                 self.df['total_sheep'] = self.df[sheep_cols].sum(axis=1, skipna=True)
@@ -354,17 +369,56 @@ class APMTDataProcessor:
                 self.df['total_goats'] = self.df[goat_cols].sum(axis=1, skipna=True)
         
             self.df['total_sr'] = self.df['total_sheep'] + self.df['total_goats']
+
+            # FIXED: Female percentage calculation
+            female_sheep_col = 'C3. Number of Ewes currently owned (total: at home + away + relatives/friends)'
+            female_goat_col = 'C3. Number of Does currently owned (total: at home + away + relatives/friends)'
         
-            # Female percentage - flexible detection of female animals
-            female_patterns = ['ewe', 'doe', 'female']
-            female_cols = [col for pattern in female_patterns for col in self.df.columns 
-                        if pattern in col.lower() and any(herd_col in col.lower() for herd_col in ['c3', 'herd', 'number'])]
+            female_sheep = pd.to_numeric(self.df[female_sheep_col], errors='coerce').fillna(0) if female_sheep_col in self.df.columns else 0
+            female_goats = pd.to_numeric(self.df[female_goat_col], errors='coerce').fillna(0) if female_goat_col in self.df.columns else 0
         
-            female_total = sum([self.df[col].fillna(0) for col in female_cols]) if female_cols else 0
+            total_female = female_sheep + female_goats
         
-            valid = self.df['total_sr'] > 0
-            self.df.loc[valid, 'pct_female'] = (female_total[valid] / self.df.loc[valid, 'total_sr'] * 100)
+            # Safe division with bounds checking
+            valid = (self.df['total_sr'] > 0) & (total_female >= 0)
+            self.df.loc[valid, 'pct_female'] = (total_female[valid] / self.df.loc[valid, 'total_sr'] * 100)
         
+            # For invalid cases, set to 0
+            self.df.loc[~valid, 'pct_female'] = 0
+        
+            # Ensure reasonable bounds (0-100%)
+            self.df['pct_female'] = self.df['pct_female'].clip(0, 100)
+
+            # Rest of the method for births, mortality, losses...
+            birth_cols = [
+                'C4. Number of Rams born in the last 1 month',
+                'C4. Number of Ewes born in the last 1 month', 
+                'C4. Number of Bucks born in the last 1 month',
+                'C4. Number of Does born in the last 1 month'
+            ]
+            birth_cols = [col for col in birth_cols if col in self.df.columns]
+        
+            mortality_cols = [
+                'C5. Number of Rams that died in the last 1 month',
+                'C5. Number of Ewes that died in the last 1 month',
+                'C5. Number of Bucks that died in the last 1 month',
+                'C5. Number of Does that died in the last 1 month'
+            ]
+            mortality_cols = [col for col in mortality_cols if col in self.df.columns]
+        
+            loss_cols = [
+                'C6. Number of Rams lost/not found or lost to wild animals in the last 1 month',
+                'C6. Number of Ewes lost/not found or lost to wild animals in the last 1 month',
+                'C6. Number of Bucks lost/not found or lost to wild animals in the last 1 month',
+                'C6. Number of Does lost/not found or lost to wild animals in the last 1 month'
+            ]
+            loss_cols = [col for col in loss_cols if col in self.df.columns]
+
+            # Ensure numeric
+            for c in birth_cols + mortality_cols + loss_cols:
+                if c in self.df.columns:
+                    self.df[c] = pd.to_numeric(self.df[c], errors='coerce').fillna(0)
+
             # Births, mortality, losses
             if birth_cols:
                 self.df['total_births'] = self.df[birth_cols].sum(axis=1, skipna=True)
@@ -372,7 +426,7 @@ class APMTDataProcessor:
                 self.df['total_mortality'] = self.df[mortality_cols].sum(axis=1, skipna=True)
             if loss_cols:
                 self.df['total_losses'] = self.df[loss_cols].sum(axis=1, skipna=True)
-        
+
             # Rates with safe division
             valid = self.df['total_sr'] > 0
             for rate_col, base_col in [('birth_rate_per_100', 'total_births'),
@@ -380,89 +434,170 @@ class APMTDataProcessor:
                                     ('loss_rate_per_100', 'total_losses')]:
                 self.df.loc[valid, rate_col] = (self.df.loc[valid, base_col] / 
                                             self.df.loc[valid, 'total_sr'] * 100)
-        
+            
+            # Set rates to 0 where invalid
+            self.df.loc[~valid, ['birth_rate_per_100', 'mortality_rate_per_100', 'loss_rate_per_100']] = 0
+
         except Exception as e:
             st.warning(f"Some herd metrics could not be calculated: {str(e)}")
-            # Ensure all required columns exist
+            # Ensure all required columns exist with safe defaults
             for col in ['total_sheep','total_goats','total_sr','pct_female',
                     'total_births','total_mortality','total_losses',
                     'birth_rate_per_100','mortality_rate_per_100','loss_rate_per_100']:
                 if col not in self.df.columns:
-                    self.df[col] = 0
+                    self.df[col] = 0.0
     
-            return self.df
-
-            birth_cols = []
-            for col in ['C4. Number of Rams born in the last 1 month',
-                        'C4. Number of Ewes born in the last 1 month',
-                        'C4. Number of Bucks born in the last 1 month',
-                        'C4. Number of Does born in the last 1 month']:
-                if col in self.df.columns: birth_cols.append(col)
-
-            mortality_cols = []
-            for col in ['C5. Number of Rams that died in the last 1 month',
-                        'C5. Number of Ewes that died in the last 1 month',
-                        'C5. Number of Bucks that died in the last 1 month',
-                        'C5. Number of Does that died in the last 1 month']:
-                if col in self.df.columns: mortality_cols.append(col)
-
-            loss_cols = []
-            for col in ['C6. Number of Rams lost/not found or lost to wild animals in the last 1 month',
-                        'C6. Number of Ewes lost/not found or lost to wild animals in the last 1 month',
-                        'C6. Number of Bucks lost/not found or lost to wild animals in the last 1 month',
-                        'C6. Number of Does lost/not found or lost to wild animals in the last 1 month']:
-                if col in self.df.columns: loss_cols.append(col)
-
-            # Ensure numeric
-            numeric_like = sheep_cols + goat_cols + birth_cols + mortality_cols + loss_cols
-            for c in numeric_like:
-                if c in self.df.columns:
-                    self.df[c] = pd.to_numeric(self.df[c], errors='coerce')
-
-            # Totals
-            if sheep_cols:
-                self.df['total_sheep'] = self.df[sheep_cols].sum(axis=1, skipna=True).fillna(0)
-            if goat_cols:
-                self.df['total_goats'] = self.df[goat_cols].sum(axis=1, skipna=True).fillna(0)
-            self.df['total_sr'] = self.df['total_sheep'] + self.df['total_goats']
-
-            # Female percentage
-            female_sheep = self.df['C3. Number of Ewes currently owned (total: at home + away + relatives/friends)'].fillna(0) if 'C3. Number of Ewes currently owned (total: at home + away + relatives/friends)' in self.df.columns else 0
-            female_goats = self.df['C3. Number of Does currently owned (total: at home + away + relatives/friends)'].fillna(0) if 'C3. Number of Does currently owned (total: at home + away + relatives/friends)' in self.df.columns else 0
-            valid = self.df['total_sr'] > 0
-            self.df.loc[valid, 'pct_female'] = ((pd.Series(female_sheep)[valid] + pd.Series(female_goats)[valid]) /
-                                                self.df.loc[valid, 'total_sr'] * 100)
-
-            # Births, mortality, losses
-            if birth_cols:
-                self.df['total_births'] = self.df[birth_cols].sum(axis=1, skipna=True).fillna(0)
-            if mortality_cols:
-                self.df['total_mortality'] = self.df[mortality_cols].sum(axis=1, skipna=True).fillna(0)
-            if loss_cols:
-                self.df['total_losses'] = self.df[loss_cols].sum(axis=1, skipna=True).fillna(0)
-
-            # Rates
-            valid = self.df['total_sr'] > 0
-            self.df.loc[valid, 'birth_rate_per_100'] = self.df.loc[valid, 'total_births'] / self.df.loc[valid, 'total_sr'] * 100
-            self.df.loc[valid, 'mortality_rate_per_100'] = self.df.loc[valid, 'total_mortality'] / self.df.loc[valid, 'total_sr'] * 100
-            self.df.loc[valid, 'loss_rate_per_100'] = self.df.loc[valid, 'total_losses'] / self.df.loc[valid, 'total_sr'] * 100
-
+    def calculate_pl_metrics(self):
+        """Calculate Profit & Loss metrics for each household"""
+        try:
+            # Initialize P&L columns
+            self.df['total_revenue'] = 0
+            self.df['total_costs'] = 0
+            self.df['net_profit'] = 0
+            self.df['profit_margin'] = 0
+            
+            # REVENUE CALCULATION
+            # Livestock sales revenue
+            revenue_components = []
+            
+            # KPMD sales revenue
+            if 'E1a. How many sheep did you sell to KPMD off-takers  last month?' in self.df.columns and 'E1c. What was the average price per sheep last month?' in self.df.columns:
+                self.df['sheep_kpmd_revenue'] = (
+                    self.df['E1a. How many sheep did you sell to KPMD off-takers  last month?'].fillna(0) *
+                    self.df['E1c. What was the average price per sheep last month?'].fillna(0)
+                )
+                revenue_components.append('sheep_kpmd_revenue')
+            
+            if 'E2a. How many goats did you sell to KPMD off-takers  last month?' in self.df.columns and 'E2c. What was the average price per goat last month?' in self.df.columns:
+                self.df['goat_kpmd_revenue'] = (
+                    self.df['E2a. How many goats did you sell to KPMD off-takers  last month?'].fillna(0) *
+                    self.df['E2c. What was the average price per goat last month?'].fillna(0)
+                )
+                revenue_components.append('goat_kpmd_revenue')
+            
+            # Non-KPMD sales revenue
+            if 'E3b. How many sheep did you sell to non-KPMD off-takers  last month?' in self.df.columns and 'E3d. What was the average price per sheep last month?' in self.df.columns:
+                self.df['sheep_non_kpmd_revenue'] = (
+                    self.df['E3b. How many sheep did you sell to non-KPMD off-takers  last month?'].fillna(0) *
+                    self.df['E3d. What was the average price per sheep last month?'].fillna(0)
+                )
+                revenue_components.append('sheep_non_kpmd_revenue')
+            
+            if 'E4b. How many goats did you sell to non-KPMD off-takers  last month?' in self.df.columns and 'E4d. What was the average price per goat last month?' in self.df.columns:
+                self.df['goat_non_kpmd_revenue'] = (
+                    self.df['E4b. How many goats did you sell to non-KPMD off-takers  last month?'].fillna(0) *
+                    self.df['E4d. What was the average price per goat last month?'].fillna(0)
+                )
+                revenue_components.append('goat_non_kpmd_revenue')
+            
+            # Fodder sales revenue
+            if 'B6d. At What price did you sell a 15 kg bale last month?' in self.df.columns and 'B6e. Number of 15 kg bales sold in the last 1 month?' in self.df.columns:
+                self.df['fodder_revenue'] = (
+                    self.df['B6d. At What price did you sell a 15 kg bale last month?'].fillna(0) *
+                    self.df['B6e. Number of 15 kg bales sold in the last 1 month?'].fillna(0)
+                )
+                revenue_components.append('fodder_revenue')
+            
+            # Total revenue
+            if revenue_components:
+                self.df['total_revenue'] = self.df[revenue_components].sum(axis=1)
+            
+            # COST CALCULATION
+            cost_components = []
+            
+            # Feed costs
+            if 'Feed_Expenditure' in self.df.columns:
+                self.df['feed_costs'] = self.df['Feed_Expenditure'].fillna(0)
+                cost_components.append('feed_costs')
+            
+            # Herding costs
+            if 'B3b. What was the cost of herding per month (Ksh)?' in self.df.columns:
+                self.df['herding_costs'] = self.df['B3b. What was the cost of herding per month (Ksh)?'].fillna(0)
+                cost_components.append('herding_costs')
+            
+            # Veterinary costs
+            vet_costs = []
+            if 'D1b. What was the cost of small ruminants vaccination in KSH per animal in the last month?' in self.df.columns:
+                self.df['vaccination_costs'] = self.df['D1b. What was the cost of small ruminants vaccination in KSH per animal in the last month?'].fillna(0)
+                vet_costs.append('vaccination_costs')
+            
+            if 'D3b. What was the total cost of treatment in KSH last month?' in self.df.columns:
+                self.df['treatment_costs'] = self.df['D3b. What was the total cost of treatment in KSH last month?'].fillna(0)
+                vet_costs.append('treatment_costs')
+            
+            if 'D4a. What was the total of cost of deworming in KSH last month?' in self.df.columns:
+                self.df['deworming_costs'] = self.df['D4a. What was the total of cost of deworming in KSH last month?'].fillna(0)
+                vet_costs.append('deworming_costs')
+            
+            if vet_costs:
+                self.df['vet_costs'] = self.df[vet_costs].sum(axis=1)
+                cost_components.append('vet_costs')
+            
+            # Transport costs
+            transport_cols = [
+                'E1h. What was the transport cost to  the market per sheep last month?',
+                'E2h. What was the transport cost to  the market per goat last month?',
+                'E3i. What was the transport cost to  the market per sheep last month?',
+                'E4i. What was the transport cost to  the market per goat last month?'
+            ]
+            transport_costs = [col for col in transport_cols if col in self.df.columns]
+            if transport_costs:
+                self.df['transport_costs'] = self.df[transport_costs].sum(axis=1)
+                cost_components.append('transport_costs')
+            
+            # Other costs (fencing, minerals, etc.)
+            other_cost_cols = [
+                'B4b. What is the total cost of fencing(Ksh)?',
+                'B4b. What is the total monthly cost of use of minerals(Ksh)?',
+                'B4b. What is the total monthly cost of catration of small ruminants(Ksh)?',
+                'B4b. What is the total monthly cost of hoof trimming(Ksh)?',
+                'B4b. What is the total monthly cost of cleaning the pens(Ksh)?',
+                'B4b. What is the total monthly cost of ear tagging(Ksh)?',
+                'B4b. What is the total monthly cost of water(Ksh)?',
+                'B4b. What is the total monthly cost of spraying of acaricides(Ksh)?'
+            ]
+            other_costs = [col for col in other_cost_cols if col in self.df.columns]
+            if other_costs:
+                self.df['other_costs'] = self.df[other_costs].sum(axis=1)
+                cost_components.append('other_costs')
+            
+            # Total costs
+            if cost_components:
+                self.df['total_costs'] = self.df[cost_components].sum(axis=1)
+            
+            # NET PROFIT & MARGIN
+            self.df['net_profit'] = self.df['total_revenue'] - self.df['total_costs']
+            
+            # Profit margin (handle division by zero)
+            valid_revenue = self.df['total_revenue'] > 0
+            self.df.loc[valid_revenue, 'profit_margin'] = (
+                self.df.loc[valid_revenue, 'net_profit'] / 
+                self.df.loc[valid_revenue, 'total_revenue'] * 100
+            )
+            
+            # Channel-specific profitability
+            if all(col in self.df.columns for col in ['sheep_kpmd_revenue', 'sheep_non_kpmd_revenue']):
+                self.df['sheep_kpmd_profit_margin'] = (
+                    (self.df['sheep_kpmd_revenue'] - self.df.get('transport_costs', 0) * 0.5) / 
+                    self.df['sheep_kpmd_revenue'] * 100
+                ).replace([np.inf, -np.inf], 0).fillna(0)
+                
+                self.df['sheep_non_kpmd_profit_margin'] = (
+                    (self.df['sheep_non_kpmd_revenue'] - self.df.get('transport_costs', 0) * 0.5) / 
+                    self.df['sheep_non_kpmd_revenue'] * 100
+                ).replace([np.inf, -np.inf], 0).fillna(0)
+            
+            st.success("P&L metrics calculated successfully")
+            
         except Exception as e:
-            st.warning(f"Some herd metrics could not be calculated: {str(e)}")
-            for col in ['total_sheep','total_goats','total_sr','pct_female',
-                        'total_births','total_mortality','total_losses',
-                        'birth_rate_per_100','mortality_rate_per_100','loss_rate_per_100']:
-                if col not in self.df.columns:
-                    self.df[col] = 0
-        
-        return self.df
+            st.warning(f"Some P&L metrics could not be calculated: {str(e)}")
 
 # -------------------------------------------------
-# Dashboard Renderer
+# Dashboard Renderer (COMPLETE WITH ALL METHODS)
 # -------------------------------------------------
 class DashboardRenderer:
     def __init__(self, data_processor):
-        self.dp = data_processor  # keep processor only
+        self.dp = data_processor
 
     @property
     def df(self):
@@ -498,7 +633,176 @@ class DashboardRenderer:
                 """, unsafe_allow_html=True)
         except Exception as e:
             st.warning(f"Could not create comparison cards for {metric_col}")
-    
+
+    # ---------------- NEW: P&L Analysis Page ----------------
+    def render_pl_analysis(self):
+        st.header("💰 Profit & Loss Analysis")
+        
+        # Calculate P&L metrics
+        self.dp.calculate_pl_metrics()
+        
+        tab1, tab2, tab3, tab4 = st.tabs(["Overall Profitability", "Revenue Analysis", "Cost Analysis", "Channel Comparison"])
+        
+        with tab1:
+            st.subheader("Overall Profitability")
+            
+            # Key profitability metrics
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                avg_profit = self.df['net_profit'].mean()
+                profit_class = "profit-positive" if avg_profit >= 0 else "profit-negative"
+                st.metric("Average Net Profit (KES)", f"{avg_profit:,.0f}", 
+                         delta=f"{avg_profit:,.0f}" if avg_profit >= 0 else f"{avg_profit:,.0f}")
+            
+            with col2:
+                avg_margin = self.df['profit_margin'].mean()
+                margin_class = "profit-positive" if avg_margin >= 0 else "profit-negative"
+                st.metric("Average Profit Margin (%)", f"{avg_margin:.1f}%")
+            
+            with col3:
+                profitable_hhs = (self.df['net_profit'] > 0).sum()
+                total_hhs = len(self.df)
+                profitable_pct = (profitable_hhs / total_hhs) * 100
+                st.metric("Profitable Households", f"{profitable_pct:.1f}%")
+            
+            with col4:
+                avg_revenue = self.df['total_revenue'].mean()
+                st.metric("Average Monthly Revenue (KES)", f"{avg_revenue:,.0f}")
+            
+            # Profit distribution
+            st.subheader("Profit Distribution")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Profit histogram
+                fig = px.histogram(self.df, x='net_profit', 
+                                 title='Distribution of Net Profit',
+                                 labels={'net_profit': 'Net Profit (KES)'},
+                                 color_discrete_sequence=['#2E86AB'])
+                fig.update_layout(bargap=0.1)
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                # Profit by KPMD status
+                if 'kpmd_registered' in self.df.columns:
+                    fig = px.box(self.df, x='kpmd_registered', y='net_profit',
+                               title='Profit Distribution by KPMD Status',
+                               labels={'kpmd_registered': 'KPMD Registered', 'net_profit': 'Net Profit (KES)'},
+                               color='kpmd_registered')
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            # Profitability by county
+            if 'County' in self.df.columns:
+                st.subheader("Profitability by County")
+                county_profit = self.df.groupby('County')['net_profit'].agg(['mean', 'count']).reset_index()
+                county_profit = county_profit[county_profit['count'] >= 3]  # Only show counties with sufficient data
+                
+                fig = px.bar(county_profit, x='County', y='mean',
+                           title='Average Net Profit by County',
+                           labels={'mean': 'Average Net Profit (KES)'},
+                           color='mean',
+                           color_continuous_scale='RdYlGn')
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with tab2:
+            st.subheader("Revenue Analysis")
+            
+            # Revenue composition
+            revenue_cols = [col for col in self.df.columns if 'revenue' in col.lower() and col != 'total_revenue']
+            if revenue_cols:
+                avg_revenue_composition = self.df[revenue_cols].mean().sort_values(ascending=False)
+                
+                fig = px.pie(values=avg_revenue_composition.values, 
+                           names=avg_revenue_composition.index,
+                           title='Average Revenue Composition')
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Revenue by KPMD status
+            if 'kpmd_registered' in self.df.columns:
+                revenue_comparison = self.df.groupby('kpmd_registered')['total_revenue'].mean().reset_index()
+                revenue_comparison['KPMD_Status'] = revenue_comparison['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+                
+                fig = px.bar(revenue_comparison, x='KPMD_Status', y='total_revenue',
+                           title='Average Revenue by KPMD Status',
+                           labels={'total_revenue': 'Average Revenue (KES)'})
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with tab3:
+            st.subheader("Cost Structure Analysis")
+            
+            # Cost composition
+            cost_cols = [col for col in self.df.columns if 'costs' in col.lower() and col != 'total_costs']
+            if cost_cols:
+                avg_cost_composition = self.df[cost_cols].mean().sort_values(ascending=False)
+                
+                fig = px.bar(avg_cost_composition, 
+                           title='Average Cost Composition',
+                           labels={'value': 'Average Cost (KES)', 'index': 'Cost Category'})
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Cost efficiency
+            st.subheader("Cost Efficiency")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if 'total_costs' in self.df.columns and 'total_sr' in self.df.columns:
+                    self.df['cost_per_animal'] = self.df['total_costs'] / self.df['total_sr'].replace(0, np.nan)
+                    valid_data = self.df[self.df['cost_per_animal'].notna()]
+                    if len(valid_data) > 0:
+                        self.create_comparison_cards(valid_data, 'cost_per_animal', 'Cost per Animal', 'KES {:.0f}')
+            
+            with col2:
+                if 'total_revenue' in self.df.columns and 'total_costs' in self.df.columns:
+                    self.df['cost_ratio'] = self.df['total_costs'] / self.df['total_revenue'].replace(0, np.nan)
+                    valid_data = self.df[self.df['cost_ratio'].notna()]
+                    if len(valid_data) > 0:
+                        self.create_comparison_cards(valid_data, 'cost_ratio', 'Cost-to-Revenue Ratio', '{:.2f}')
+        
+        with tab4:
+            st.subheader("Channel Profitability Comparison")
+            
+            # Channel-specific profit margins
+            channel_cols = ['sheep_kpmd_profit_margin', 'sheep_non_kpmd_profit_margin']
+            available_channels = [col for col in channel_cols if col in self.df.columns]
+            
+            if available_channels:
+                channel_data = []
+                for col in available_channels:
+                    channel_name = ' '.join(col.split('_')[:3]).title()
+                    for kpmd_status in [0, 1]:
+                        subset = self.df[self.df['kpmd_registered'] == kpmd_status]
+                        avg_margin = subset[col].mean()
+                        channel_data.append({
+                            'Channel': channel_name,
+                            'Profit_Margin': avg_margin,
+                            'KPMD_Status': 'KPMD Registered' if kpmd_status == 1 else 'Non-KPMD Registered'
+                        })
+                
+                channel_df = pd.DataFrame(channel_data)
+                fig = px.bar(channel_df, x='Channel', y='Profit_Margin', color='KPMD_Status',
+                           title='Channel Profit Margins by KPMD Registration',
+                           barmode='group',
+                           labels={'Profit_Margin': 'Profit Margin (%)'})
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Breakeven analysis
+            st.subheader("Breakeven Analysis")
+            breakeven_data = self.df.copy()
+            breakeven_data['breakeven_status'] = np.where(breakeven_data['net_profit'] >= 0, 'Profitable', 'Loss-making')
+            
+            if 'kpmd_registered' in breakeven_data.columns:
+                breakeven_summary = pd.crosstab(breakeven_data['kpmd_registered'], breakeven_data['breakeven_status'], normalize='index') * 100
+                breakeven_summary = breakeven_summary.reset_index()
+                breakeven_summary['KPMD_Status'] = breakeven_summary['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+                breakeven_melted = breakeven_summary.melt(id_vars=['KPMD_Status'], value_vars=['Profitable', 'Loss-making'], 
+                                                        var_name='Status', value_name='Percentage')
+                
+                fig = px.bar(breakeven_melted, x='KPMD_Status', y='Percentage', color='Status',
+                           title='Breakeven Status by KPMD Registration',
+                           barmode='stack')
+                st.plotly_chart(fig, use_container_width=True)
+
     # ---------------- Field & Data Outlook ----------------
     def render_field_outlook(self):
         st.header("🧭 Field & Data Outlook")
@@ -1316,7 +1620,7 @@ class DashboardRenderer:
 # Main App
 # -------------------------------------------------
 def main():
-    st.title("APMT Longitudinal Dashboard")
+    st.title("APMT Project Insights")
     st.markdown('<div class="main-header">Pastoral Market Transformation Monitoring</div>', unsafe_allow_html=True)
     
     # File upload
@@ -1421,7 +1725,7 @@ def main():
             elif page == "Payments":
                 renderer.render_payments()
             elif page == "P&L Analysis":
-                renderer.render_pl_analysis()  # Make sure this method exists
+                renderer.render_pl_analysis()
             elif page == "County Comparator":
                 renderer.render_county_compare()
             elif page == "Gender Inclusion":
