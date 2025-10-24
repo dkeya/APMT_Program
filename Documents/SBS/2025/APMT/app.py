@@ -15,6 +15,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 import pydeck as pdk
+from pathlib import Path
+import json
 import re
 import io
 import os
@@ -145,36 +147,63 @@ def coalesce_first(df, candidates):
 # -------------------------------------------------
 # Data Loading (Auto)
 # -------------------------------------------------
+def _get_secret_if_available(key: str) -> str:
+    """Return secret only if it's actually available; otherwise return '' without triggering Streamlit's warning."""
+    # 0) Environment variable (safe everywhere)
+    env_val = os.getenv(key) or os.getenv(key.upper()) or ""
+    if env_val:
+        return env_val.strip()
+
+    # 1) Local secrets.toml (only read st.secrets if a file exists)
+    possible_files = [
+        Path.home() / ".streamlit" / "secrets.toml",        # normal location
+        Path.cwd() / ".streamlit" / "secrets.toml",         # project-local
+        Path.home() / "streamlit" / "secrets.toml",         # odd Windows variant
+        Path(str(Path.home()) + ".streamlit") / "secrets.toml",  # message variant on some installs
+    ]
+    if any(p.exists() for p in possible_files):
+        try:
+            return (st.secrets.get(key, "") or "").strip()
+        except Exception:
+            return ""
+
+    # 2) Streamlit Cloud sometimes exposes all secrets as JSON in env
+    if "STREAMLIT_SECRETS" in os.environ:
+        try:
+            return json.loads(os.environ["STREAMLIT_SECRETS"]).get(key, "").strip()
+        except Exception:
+            pass
+
+    # No secrets source available
+    return ""
+
 def _resolve_data_path() -> str:
     """
     Decide which CSV to load:
-    1) st.secrets['DATA_FILE'] if provided
+    1) DATA_FILE from secrets/env (only if available, no warnings)
     2) URL query param ?data=...
     3) common relative filenames in the repo
+    4) your original Windows path (if it exists)
     """
-    # 1) Secrets (Streamlit Cloud → Settings → Secrets)
-    try:
-        secret_path = st.secrets.get("DATA_FILE", "").strip()
-        if secret_path:
-            return secret_path
-    except Exception:
-        pass
+    # 1) Secret/env
+    secret_path = _get_secret_if_available("DATA_FILE")
+    if secret_path:
+        return secret_path
 
-    # 2) Query param ?data=...
+    # 2) Query param
     try:
-        qs = st.query_params  # Streamlit >=1.30
-        if "data" in qs and len(qs["data"]) > 0:
+        qs = st.query_params
+        if "data" in qs and qs["data"]:
             return qs["data"]
     except Exception:
-        # older versions: st.experimental_get_query_params()
         try:
             qs = st.experimental_get_query_params()
-            if "data" in qs and len(qs["data"]) > 0:
+            if "data" in qs and qs["data"]:
                 return qs["data"][0]
         except Exception:
             pass
 
-    # 3) Known relative filenames (add any you use)
+    # 3) Relative files
     candidates = [
         "APMT_Longitudinal_Survey.csv",
         "data/APMT_Longitudinal_Survey.csv",
@@ -185,12 +214,12 @@ def _resolve_data_path() -> str:
         if os.path.exists(p):
             return p
 
-    # 4) Last resort: keep your original local path if it exists (dev on Windows)
+    # 4) Original local path for dev
     original = r"C:\Users\dkeya\Documents\SBS\2025\APMT\APMT_Longitudinal_Survey.csv"
     if os.path.exists(original):
         return original
 
-    # If nothing is found, return the first candidate (for error message)
+    # For the error message if nothing exists
     return candidates[0]
 
 DATA_PATH = _resolve_data_path()
