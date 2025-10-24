@@ -178,49 +178,9 @@ def _get_secret_if_available(key: str) -> str:
     return ""
 
 def _resolve_data_path() -> str:
-    """
-    Decide which CSV to load:
-    1) DATA_FILE from secrets/env (only if available, no warnings)
-    2) URL query param ?data=...
-    3) common relative filenames in the repo
-    4) your original Windows path (if it exists)
-    """
-    # 1) Secret/env
-    secret_path = _get_secret_if_available("DATA_FILE")
-    if secret_path:
-        return secret_path
-
-    # 2) Query param
-    try:
-        qs = st.query_params
-        if "data" in qs and qs["data"]:
-            return qs["data"]
-    except Exception:
-        try:
-            qs = st.experimental_get_query_params()
-            if "data" in qs and qs["data"]:
-                return qs["data"][0]
-        except Exception:
-            pass
-
-    # 3) Relative files
-    candidates = [
-        "APMT_Longitudinal_Survey.csv",
-        "data/APMT_Longitudinal_Survey.csv",
-        "apmt_data.csv",
-        "data/apmt_data.csv",
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-
-    # 4) Original local path for dev
-    original = r"C:\Users\dkeya\Documents\SBS\2025\APMT\APMT_Longitudinal_Survey.csv"
-    if os.path.exists(original):
-        return original
-
-    # For the error message if nothing exists
-    return candidates[0]
+    """Always load the CSV that sits next to this app.py file."""
+    from pathlib import Path
+    return str((Path(__file__).resolve().parent / "APMT_Longitudinal_Survey.csv"))
 
 DATA_PATH = _resolve_data_path()
 
