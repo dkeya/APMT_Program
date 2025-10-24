@@ -1,10 +1,11 @@
-# app.py — APMT Longitudinal Dashboard (full, preserved features + hardening for new waves)
+# app.py — APMT Longitudinal Dashboard (auto-load + fixes)
 # -----------------------------------------------------------------------------------------
-# Notes:
-# - All previously implemented pages and features are preserved.
-# - Hardening applied for: date parsing, phone strings, GPS duplicates, flexible column detection,
-#   boolean/numeric coercion, multi-select parsing, P&L math, and offtake mapping.
-# - Designed to accept future CSVs without external pre-validation.
+# Changes in this version:
+# - Auto-loads CSV from the provided path (no file uploader).
+# - Adds "Reload data" button (clears cache and reruns).
+# - Fixes coalesce_first helper.
+# - Keeps the pydeck map style and previous chart ordering (county/KPMD chart between
+#   Monthly Submissions and the Household Locations map).
 
 import streamlit as st
 import pandas as pd
@@ -16,6 +17,7 @@ from datetime import datetime
 import pydeck as pdk
 import re
 import io
+import os
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -96,7 +98,6 @@ def yn(x):
         return 1
     if s in _NO:
         return 0
-    # handle tokens like "Yes (foo)" / "No (bar)" / "Yes, ..."
     if s.startswith('yes'):
         return 1
     if s.startswith('no'):
@@ -134,10 +135,53 @@ def one_hot_multiselect(series: pd.Series) -> pd.DataFrame:
 
 def coalesce_first(df, candidates):
     """Return the first existing column name from candidates, else None."""
+    if not isinstance(df, pd.DataFrame):
+        return None
     for c in candidates:
         if c in df.columns:
             return c
     return None
+
+# -------------------------------------------------
+# Data Loading (Auto)
+# -------------------------------------------------
+DATA_PATH = r"C:\Users\dkeya\Documents\SBS\2025\APMT\APMT_Longitudinal_Survey.csv"
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_apmt_csv(path: str) -> pd.DataFrame:
+    """
+    Robust CSV loader with multiple encodings and fallback character replacement.
+    Auto-detects delimiter when possible.
+    """
+    encodings = ['utf-8', 'utf-8-sig', 'cp1252', 'latin-1', 'ISO-8859-1', 'windows-1252']
+    # Try straightforward reads first
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except UnicodeDecodeError:
+            continue
+        except FileNotFoundError:
+            raise
+        except Exception:
+            continue
+    # Try python engine with sep=None (delimiter sniff)
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, encoding=enc, sep=None, engine='python')
+        except UnicodeDecodeError:
+            continue
+        except FileNotFoundError:
+            raise
+        except Exception:
+            continue
+    # Final fallback with character replacement
+    try:
+        return pd.read_csv(path, encoding='utf-8', errors='replace')
+    except FileNotFoundError:
+        raise
+    except Exception:
+        # As last resort try latin-1 with replacement
+        return pd.read_csv(path, encoding='latin-1', errors='replace')
 
 # -------------------------------------------------
 # Data Processor
@@ -155,10 +199,6 @@ class APMTDataProcessor:
         for col in self.df.columns:
             if any(k in col.lower() for k in ['phone', 'telephone', 'household id', '_id', '_uuid']):
                 self.df[col] = self.df[col].astype(str)
-
-        # Normalize duplicate GPS bundles: prefer canonical underscored columns
-        # If both duplicated sets exist, keep the underscored set.
-        # Nothing to drop explicitly—just ensure we reference underscored names elsewhere.
 
         # Strip column whitespace and normalize accidental double spaces
         self.df.columns = [re.sub(r'\s+', ' ', c).strip() for c in self.df.columns]
@@ -191,7 +231,7 @@ class APMTDataProcessor:
         mapping['deaths'] = self._find_columns_pattern(r'C5\..*(died|death)')
         mapping['losses'] = self._find_columns_pattern(r'C6\..*(lost|not found|wild)')
 
-        # Animal health (match “livestock” vs “small ruminants” variants)
+        # Animal health
         mapping['vaccination'] = coalesce_first(self.df, [
             'D1. Did you vaccinate your small ruminants in the last month?',
             'D1. Did you vaccinate your small ruminants livestock in the last month?',
@@ -206,7 +246,7 @@ class APMTDataProcessor:
         ])
         mapping['feed_sources'] = self._find_columns_pattern(r'B5b\..*buy feeds')
 
-        # Offtake patterns (sheep/goats, KPMD/non-KPMD)
+        # Offtake patterns
         mapping['sheep_kpmd_sales'] = self._find_columns_pattern(r'^E1\..*sheep.*KPMD|^E1\.$')
         mapping['goat_kpmd_sales'] = self._find_columns_pattern(r'^E2\..*goat.*KPMD|^E2\.$')
         mapping['sheep_non_kpmd_sales'] = self._find_columns_pattern(r'^E3\..*sheep|^E3\.$')
@@ -241,7 +281,7 @@ class APMTDataProcessor:
     # ---------- standardization & feature engineering ----------
     def enhanced_standardize_data(self):
         try:
-            # 1) Robust date parsing (supports DD/MM/YYYY, ISO strings with timezone)
+            # 1) Robust date parsing
             def _coerce_date(s):
                 return pd.to_datetime(s, errors='coerce', dayfirst=True, infer_datetime_format=True)
 
@@ -256,7 +296,6 @@ class APMTDataProcessor:
                     date_parsed = True
                     break
             if not date_parsed:
-                # fallback: artificial timeline (stable but keeps visuals alive)
                 self.df['month'] = [f"2024-{i:02d}" for i in range(1, min(len(self.df) + 1, 13))]
 
             # 2) KPMD registration flag
@@ -266,14 +305,14 @@ class APMTDataProcessor:
             else:
                 self.df['kpmd_registered'] = 0
 
-            # 3) Household treatment flag (Treatment/Control)
+            # 3) Household treatment flag
             arm_col = self.column_mapping['household_type']
             if arm_col:
                 self.df['is_treatment'] = self.df[arm_col].astype(str).str.contains('Treatment', case=False, na=False).astype(int)
             else:
                 self.df['is_treatment'] = 0
 
-            # 4) Boolean coercion by pattern families (works across small schema drift)
+            # 4) Boolean coercion families
             bool_patterns = [
                 r'^C1\.', r'^C2\.', r'^D1\..*vaccinate', r'^D3\..*treat', r'^D4\..*deworm',
                 r'^B5a\.', r'^B6a\.', r'^J1\.'
@@ -282,7 +321,7 @@ class APMTDataProcessor:
                 for col in self._find_columns_pattern(pat):
                     self.df[col] = self.df[col].apply(yn).astype(int)
 
-            # 5) Numeric coercion for common cost/price/qty fields (patterned)
+            # 5) Numeric coercion
             numeric_patterns = [
                 r'B3b.*cost.*herding', r'B4b\..*cost', r'B5c\..*price.*bale', r'B5d\..*Number.*bales.*purchased',
                 r'B6b\..*Quantity.*harvested', r'B6d\..*price.*sell', r'B6e\..*Number.*bales.*sold',
@@ -294,24 +333,23 @@ class APMTDataProcessor:
                 for col in self._find_columns_pattern(pat):
                     self.df[col] = to_num(self.df[col]).fillna(0)
 
-            # 6) Enhanced disease mapping
+            # 6) Disease mapping
             self.enhanced_disease_mapping()
 
-            # 7) Feed expenditure calculation (if purchase price + qty available)
+            # 7) Feed expenditure
             self.enhanced_feed_calculation()
 
-            # 8) Offtake mapping (resolve key columns)
+            # 8) Offtake mapping
             self.enhanced_offtake_mapping()
 
-            # 9) Gender mapping (stable keys)
+            # 9) Gender mapping
             self.enhanced_gender_mapping()
 
-            # 10) Climate resilience indicators
+            # 10) Climate resilience
             self.calculate_climate_resilience()
 
         except Exception as e:
             st.warning(f"Some data standardization issues occurred: {str(e)}")
-            # Fallbacks (minimal to keep visuals alive)
             if 'month' not in self.df.columns:
                 self.df['month'] = [f"2024-{i:02d}" for i in range(1, min(len(self.df) + 1, 13))]
             if 'kpmd_registered' not in self.df.columns:
@@ -320,11 +358,8 @@ class APMTDataProcessor:
                 self.df['is_treatment'] = 0
 
     def enhanced_disease_mapping(self):
-        # vaccination (D1c) and treatment (D3c) checkboxes (wide schema)
         self.vacc_disease_cols = [c for c in self.df.columns if c.startswith('D1c. ') and '/' in c]
         self.treat_disease_cols = [c for c in self.df.columns if c.startswith('D3c. ') and '/' in c]
-
-        # Coerce to 0/1 when these are 1/0 strings
         for col in self.vacc_disease_cols + self.treat_disease_cols:
             self.df[col] = pd.to_numeric(self.df[col].astype(str).replace({'1': 1, '0': 0}), errors='coerce').fillna(0).astype(int)
 
@@ -337,11 +372,7 @@ class APMTDataProcessor:
             self.df['Feed_Expenditure'] = 0
 
     def enhanced_offtake_mapping(self):
-        # Resolve main yes/no sold columns per species/channel
-        # Prefer exact in-sample labels; fall back to pattern search
         self.offtake_col_mapping = {}
-
-        # Sheep — KPMD & Non
         sheep_kpmd = coalesce_first(self.df, ['E1. Did you sell sheep to KPMD off-takers last  month?'])
         if not sheep_kpmd:
             sheep_kpmd = coalesce_first(self.df, [c for c in self._find_columns_pattern(r'^E1\..*sell sheep')])
@@ -354,7 +385,6 @@ class APMTDataProcessor:
         if sheep_non:
             self.offtake_col_mapping['sheep_non_kpmd_sold'] = sheep_non
 
-        # Goats — KPMD & Non
         goat_kpmd = coalesce_first(self.df, ['E2. Did you sell goats to KPMD off-takers last  month?'])
         if not goat_kpmd:
             goat_kpmd = coalesce_first(self.df, [c for c in self._find_columns_pattern(r'^E2\..*sell goats')])
@@ -380,7 +410,6 @@ class APMTDataProcessor:
         }
 
     def calculate_climate_resilience(self):
-        # Base resilience on adaptation + KPMD registration (simple composite)
         a_col = self.column_mapping.get('adaptation_measures')
         if a_col:
             self.df['adaptation_score'] = self.df[a_col].apply(yn)
@@ -392,13 +421,11 @@ class APMTDataProcessor:
 
     def calculate_herd_metrics(self):
         try:
-            # Initialize
             for col in ['total_sheep','total_goats','total_sr','pct_female',
                         'total_births','total_mortality','total_losses',
                         'birth_rate_per_100','mortality_rate_per_100','loss_rate_per_100']:
                 if col not in self.df.columns: self.df[col] = 0.0
 
-            # Sheep columns
             sheep_cols = [c for c in [
                 'C3. Number of Rams currently owned (total: at home + away + relatives/friends)',
                 'C3. Number of Ewes currently owned (total: at home + away + relatives/friends)'
@@ -428,7 +455,6 @@ class APMTDataProcessor:
             self.df.loc[~valid, 'pct_female'] = 0
             self.df['pct_female'] = self.df['pct_female'].clip(0, 100)
 
-            # Births/mortality/losses
             def existing(cols):
                 return [c for c in cols if c in self.df.columns]
 
@@ -532,7 +558,6 @@ class APMTDataProcessor:
             if vet_costs:
                 self.df['vet_costs'] = self.df[vet_costs].sum(axis=1); cost_components.append('vet_costs')
 
-            # Transport costs across channels
             transport_cols = [
                 'E1h. What was the transport cost to  the market per sheep last month?',
                 'E2h. What was the transport cost to  the market per goat last month?',
@@ -544,7 +569,7 @@ class APMTDataProcessor:
                 self.df['transport_costs'] = self.df[existing_transport].sum(axis=1)
                 cost_components.append('transport_costs')
 
-            other_costs_cols = [  # tolerant to presence/absence
+            other_costs_cols = [
                 'B4b. What is the total cost of fencing(Ksh)?',
                 'B4b. What is the total monthly cost of use of minerals(Ksh)?',
                 'B4b. What is the total monthly cost of catration of small ruminants(Ksh)?',
@@ -566,10 +591,10 @@ class APMTDataProcessor:
             self.df['net_profit'] = self.df['total_revenue'] - self.df['total_costs']
 
             valid_revenue = self.df['total_revenue'] > 0
-            self.df.loc[valid_revenue, 'profit_margin'] = \
-                (self.df.loc[valid_revenue, 'net_profit'] / self.df.loc[valid_revenue, 'total_revenue'] * 100)
+            self.df.loc[valid_revenue, 'profit_margin'] = (
+                self.df.loc[valid_revenue, 'net_profit'] / self.df.loc[valid_revenue, 'total_revenue'] * 100
+            )
 
-            # Channel-specific simple margins for sheep (available in earlier code)
             if all(c in self.df.columns for c in ['sheep_kpmd_revenue', 'transport_costs']):
                 self.df['sheep_kpmd_profit_margin'] = (
                     (self.df['sheep_kpmd_revenue'] - self.df['transport_costs'] * 0.5) /
@@ -669,7 +694,7 @@ class DashboardRenderer:
             if 'County' in self.df.columns:
                 st.subheader("Profitability by County")
                 county_profit = self.df.groupby('County', dropna=True)['net_profit'].agg(['mean', 'count']).reset_index()
-                county_profit = county_profit[county_profit['count'] >= 3]  # only if enough observations
+                county_profit = county_profit[county_profit['count'] >= 3]
                 if len(county_profit) > 0:
                     fig = px.bar(county_profit, x='County', y='mean',
                                  title='Average Net Profit by County',
@@ -753,12 +778,17 @@ class DashboardRenderer:
     def render_field_outlook(self):
         st.header("🧭 Field & Data Outlook")
 
+        # --- KPI row ---
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Total Submissions", len(self.df))
         with col2:
             latest = None
-            cand = '_submission_time' if '_submission_time' in self.df.columns else 'int_date_std' if 'int_date_std' in self.df.columns else None
+            cand = (
+                '_submission_time' if '_submission_time' in self.df.columns
+                else 'int_date_std' if 'int_date_std' in self.df.columns
+                else None
+            )
             if cand:
                 try:
                     tmp = pd.to_datetime(self.df[cand], errors='coerce')
@@ -773,17 +803,86 @@ class DashboardRenderer:
             k = self.df['kpmd_registered'].sum() if 'kpmd_registered' in self.df.columns else 0
             st.metric("KPMD Participants", int(k))
 
-        st.subheader("Submissions Over Time")
-        if 'month' in self.df.columns and not self.df['month'].isna().all():
-            monthly = self.df.groupby('month', dropna=True).size().reset_index(name='count').sort_values('month')
-            if len(monthly) > 0:
-                fig = px.line(monthly, x='month', y='count', title='Monthly Submissions', markers=True)
+        # --- Submissions over time ---
+        left, right = st.columns([0.8, 0.2])
+        with left:
+            st.subheader("Submissions Over Time")
+        with right:
+            gran = st.selectbox(
+                "Granularity", ["Daily", "Weekly", "Monthly"],
+                index=0,                      # default to Daily
+                label_visibility="collapsed"  # keep it compact
+            )
+
+        # pick the best date column available
+        date_col = (
+            '_submission_time' if '_submission_time' in self.df.columns
+            else 'int_date_std' if 'int_date_std' in self.df.columns
+            else None
+        )
+
+        if date_col:
+            tmp = self.df.copy()
+            tmp['__date'] = pd.to_datetime(tmp[date_col], errors='coerce')
+            tmp = tmp[tmp['__date'].notna()].copy()
+
+            if gran == "Daily":
+                tmp['__bucket'] = tmp['__date'].dt.date
+                x_label, title = "Date", "Daily Submission Volume"
+            elif gran == "Weekly":
+                tmp['__bucket'] = tmp['__date'].dt.to_period('W').dt.start_time.dt.date
+                x_label, title = "Week (start)", "Weekly Submission Volume"
+            else:  # Monthly
+                tmp['__bucket'] = tmp['__date'].dt.to_period('M').dt.to_timestamp()
+                x_label, title = "Month", "Monthly Submission Volume"
+
+            series = (tmp.groupby('__bucket').size()
+                        .reset_index(name='Submissions')
+                        .sort_values('__bucket'))
+
+            if len(series) > 0:
+                fig = px.line(
+                    series, x='__bucket', y='Submissions',
+                    title=title, markers=True,
+                    labels={'__bucket': x_label}
+                )
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("No time series data available after grouping")
+                st.info("No dated submissions available to plot.")
         else:
-            st.info("Month data not available for time series analysis")
+            # Fallback to existing monthly column if no timestamp exists
+            if 'month' in self.df.columns and not self.df['month'].isna().all():
+                monthly = (self.df.groupby('month').size()
+                        .reset_index(name='Submissions')
+                        .sort_values('month'))
+                fig = px.line(monthly, x='month', y='Submissions',
+                            title='Monthly Submission Volume', markers=True)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No time information available to show submissions over time.")
 
+        # --- Submissions by County and KPMD Status ---
+        st.subheader("Submissions by County and KPMD Status")
+        if 'County' in self.df.columns and 'kpmd_registered' in self.df.columns:
+            county_kpmd = (
+                self.df.groupby(['County', 'kpmd_registered'])
+                    .size()
+                    .reset_index(name='count')
+            )
+            county_kpmd['kpmd_status'] = county_kpmd['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+            fig = px.bar(
+                county_kpmd,
+                x='County',
+                y='count',
+                color='kpmd_status',
+                title='Submissions by County and KPMD Status',
+                barmode='group'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("County or KPMD data not available for this analysis")
+
+        # --- Household locations map (after the county chart) ---
         st.subheader("Household Locations")
         lat_col = '_GPS Coordinates_latitude'
         lon_col = '_GPS Coordinates_longitude'
@@ -814,16 +913,6 @@ class DashboardRenderer:
             ))
         else:
             st.info("GPS coordinates not available for mapping")
-
-        st.subheader("County Coverage - KPMD vs Non-KPMD")
-        if 'County' in self.df.columns and 'kpmd_registered' in self.df.columns:
-            county_kpmd = self.df.groupby(['County', 'kpmd_registered']).size().reset_index(name='count')
-            county_kpmd['kpmd_status'] = county_kpmd['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
-            fig = px.bar(county_kpmd, x='County', y='count', color='kpmd_status',
-                         title='Submissions by County and KPMD Status', barmode='group')
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("County or KPMD data not available for this analysis")
 
     # ---------------- Pastoral Productivity ----------------
     def render_pastoral_productivity(self):
@@ -871,7 +960,6 @@ class DashboardRenderer:
 
         with tab2:
             st.subheader("Animal Health Indicators")
-            # Vaccination coverage (tolerant to wording variants)
             vacc_col = self.dp.column_mapping.get('vaccination')
             if vacc_col and vacc_col in self.df.columns:
                 vacc_data = self.df.copy()
@@ -880,7 +968,6 @@ class DashboardRenderer:
             else:
                 st.info("Vaccination data not available")
 
-            # Treatment coverage
             treat_col = 'D3. Did you treat small ruminants for disease in the last month?'
             if treat_col in self.df.columns:
                 treat_data = self.df.copy()
@@ -889,7 +976,6 @@ class DashboardRenderer:
             else:
                 st.info("Disease treatment data not available")
 
-            # Deworming coverage
             deworm_col = 'D4. Did you deworm your small ruminants last month?'
             if deworm_col in self.df.columns:
                 deworm_data = self.df.copy()
@@ -898,7 +984,6 @@ class DashboardRenderer:
             else:
                 st.info("Deworming data not available")
 
-            # Vaccination diseases
             st.subheader("Disease Analysis")
             if hasattr(self.dp, 'vacc_disease_cols') and self.dp.vacc_disease_cols:
                 rows = []
@@ -917,7 +1002,6 @@ class DashboardRenderer:
             else:
                 st.info("Vaccination disease data not available in this dataset")
 
-            # Treatment diseases
             if hasattr(self.dp, 'treat_disease_cols') and self.dp.treat_disease_cols:
                 rows = []
                 for col in self.dp.treat_disease_cols:
@@ -935,7 +1019,6 @@ class DashboardRenderer:
             else:
                 st.info("Treatment disease data not available in this dataset")
 
-            # Vaccination providers
             prov_col = 'D2. Who performed the small ruminants vaccinations in the last month?'
             if prov_col in self.df.columns:
                 try:
@@ -1049,13 +1132,11 @@ class DashboardRenderer:
         title_species = 'Sheep' if species.lower().startswith('sheep') else 'Goats'
         st.header(f"🚚 Offtake Analysis - {title_species}")
 
-        # Ensure prefixes for price/age columns regardless of mapping
         if species.lower().startswith('sheep'):
             kpmd_prefix, non_kpmd_prefix = 'E1', 'E3'
         else:
             kpmd_prefix, non_kpmd_prefix = 'E2', 'E4'
 
-        # Resolve "sold" columns using enhanced mapping
         mapping = getattr(self.dp, 'offtake_col_mapping', {}) or {}
         if species.lower().startswith('sheep'):
             kpmd_sold_col = mapping.get('sheep_kpmd_sold')
@@ -1142,46 +1223,78 @@ class DashboardRenderer:
     # ---------------- Payments ----------------
     def render_payments(self):
         st.header("💸 Payment Methods")
-        blocks = [
-            ('Sheep – KPMD',  'E1g. How were you paid by the KPMD off-takers last  month? [Select all that apply]'),
-            ('Goats – KPMD',  'E2g. How were you paid by the KPMD off-takers last  month? [Select all that apply]'),
-            ('Sheep – Other', 'E3h. How were you paid by the non-KPMD off-takers last  month? [Select all that apply]'),
-            ('Goats – Other', 'E4h. How were you paid by the non-KPMD off-takers last  month? [Select all that apply]')
+
+        # helper: normalize whitespace/case for reliable matching
+        def _norm(s: str) -> str:
+            return re.sub(r'\s+', ' ', str(s)).strip().lower()
+
+        # Use space-normalized stems (single spaces)
+        stems = [
+            ('Sheep – KPMD',  'E1g. How were you paid by the KPMD off-takers last month? [Select all that apply]'),
+            ('Goats – KPMD',  'E2g. How were you paid by the KPMD off-takers last month? [Select all that apply]'),
+            ('Sheep – Other', 'E3h. How were you paid by the non-KPMD off-takers last month? [Select all that apply]'),
+            ('Goats – Other', 'E4h. How were you paid by the non-KPMD off-takers last month? [Select all that apply]'),
         ]
-        rows=[]
-        for label, stem in blocks:
-            mobile_cols = [c for c in self.df.columns if c.startswith(stem) and c.endswith('/Mobile payment e.g M-PESA')]
-            cash_cols   = [c for c in self.df.columns if c.startswith(stem) and c.endswith('/Cash')]
+
+        rows = []
+        cols_norm = {_norm(c): c for c in self.df.columns}  # map normalized -> original
+
+        for label, stem in stems:
+            stem_n = _norm(stem)
+
+            # 1) find all sub-option columns like "<stem>/<option>"
+            #    by comparing *normalized* strings
+            subcols = []
+            for c in self.df.columns:
+                c_n = _norm(c)
+                if c_n.startswith(stem_n) and '/' in c:
+                    subcols.append(c)
+
+            # classify subcols into mobile/cash based on suffix text
+            mobile_cols, cash_cols = [], []
+            for c in subcols:
+                suffix = _norm(c.split('/', 1)[1])
+                if ('mobile' in suffix) or ('m-pesa' in suffix) or ('mpesa' in suffix):
+                    mobile_cols.append(c)
+                if 'cash' in suffix:
+                    cash_cols.append(c)
 
             mobile_series = None
             cash_series = None
 
             if mobile_cols:
-                mobile_series = (self.df[mobile_cols].astype(str).replace({'1':1,'0':0})
-                                 .apply(pd.to_numeric, errors='coerce').fillna(0).max(axis=1))
+                mobile_series = (self.df[mobile_cols].astype(str).replace({'1': 1, '0': 0})
+                                .apply(pd.to_numeric, errors='coerce').fillna(0).max(axis=1))
             if cash_cols:
-                cash_series = (self.df[cash_cols].astype(str).replace({'1':1,'0':0})
-                               .apply(pd.to_numeric, errors='coerce').fillna(0).max(axis=1))
+                cash_series = (self.df[cash_cols].astype(str).replace({'1': 1, '0': 0})
+                            .apply(pd.to_numeric, errors='coerce').fillna(0).max(axis=1))
 
+            # 2) fallback: a single multi-select cell column equal to the stem
             if mobile_series is None or cash_series is None:
-                single_col = stem
-                if single_col in self.df.columns:
+                # look up any column whose normalized name equals the normalized stem
+                single_col = cols_norm.get(stem_n, None)
+                if single_col is not None:
                     dummies = one_hot_multiselect(self.df[single_col])
                     if mobile_series is None:
-                        mobile_token = next((t for t in dummies.columns if t.lower().startswith('mobile') or 'mpesa' in t.lower() or 'm-pesa' in t.lower()), None)
-                        mobile_series = dummies.get(mobile_token, pd.Series(0, index=self.df.index))
+                        tok = next((t for t in dummies.columns
+                                    if _norm(t).startswith('mobile') or 'mpesa' in _norm(t)), None)
+                        mobile_series = dummies.get(tok, pd.Series(0, index=self.df.index))
                     if cash_series is None:
-                        cash_token = next((t for t in dummies.columns if t.lower().startswith('cash')), None)
-                        cash_series = dummies.get(cash_token, pd.Series(0, index=self.df.index))
-                else:
-                    mobile_series = mobile_series if mobile_series is not None else pd.Series(0, index=self.df.index)
-                    cash_series   = cash_series   if cash_series   is not None else pd.Series(0, index=self.df.index)
+                        tok = next((t for t in dummies.columns if _norm(t).startswith('cash')), None)
+                        cash_series = dummies.get(tok, pd.Series(0, index=self.df.index))
 
-            tmp = self.df[['kpmd_registered','County']].copy() if 'County' in self.df.columns else self.df[['kpmd_registered']].copy()
-            tmp['block']=label
-            tmp['mobile']=pd.to_numeric(mobile_series, errors='coerce').fillna(0).clip(0,1).astype(int)
-            tmp['cash']=pd.to_numeric(cash_series, errors='coerce').fillna(0).clip(0,1).astype(int)
-            tmp['both']=((tmp['mobile']==1) & (tmp['cash']==1)).astype(int)
+            # 3) final fallback to zeros
+            if mobile_series is None:
+                mobile_series = pd.Series(0, index=self.df.index)
+            if cash_series is None:
+                cash_series = pd.Series(0, index=self.df.index)
+
+            tmp_cols = ['kpmd_registered'] + (['County'] if 'County' in self.df.columns else [])
+            tmp = self.df[tmp_cols].copy()
+            tmp['block']  = label
+            tmp['mobile'] = pd.to_numeric(mobile_series, errors='coerce').fillna(0).clip(0, 1).astype(int)
+            tmp['cash']   = pd.to_numeric(cash_series,   errors='coerce').fillna(0).clip(0, 1).astype(int)
+            tmp['both']   = ((tmp['mobile'] == 1) & (tmp['cash'] == 1)).astype(int)
             rows.append(tmp)
 
         if not rows:
@@ -1190,33 +1303,42 @@ class DashboardRenderer:
 
         payment = pd.concat(rows, ignore_index=True)
 
-        grp = payment.groupby(['block','kpmd_registered'])
+        grp = payment.groupby(['block', 'kpmd_registered'], dropna=False)
         summary = pd.DataFrame({
-            'Mobile share': grp['mobile'].mean()*100,
-            'Cash share': grp['cash'].mean()*100,
-            'Both share': grp['both'].mean()*100
+            'Mobile share': grp['mobile'].mean() * 100,
+            'Cash share':   grp['cash'].mean() * 100,
+            'Both share':   grp['both'].mean() * 100
         }).reset_index()
-        summary['KPMD Status'] = summary['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
+        summary['KPMD Status'] = summary['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
 
         long = summary.melt(
-            id_vars=['block','KPMD Status'],
-            value_vars=['Cash share','Mobile share','Both share'],
+            id_vars=['block', 'KPMD Status'],
+            value_vars=['Cash share', 'Mobile share', 'Both share'],
             var_name='Method',
             value_name='Share'
         )
+
+        if long['Share'].sum() == 0 or long.dropna(subset=['Share']).empty:
+            st.warning("No non-zero payment shares detected. Check column names in your CSV.")
+            return
+
         fig = px.bar(long, x='block', y='Share', color='Method',
-                     barmode='group', facet_col='KPMD Status',
-                     title='Payment method mix by channel/species and KPMD')
+                    barmode='group', facet_col='KPMD Status',
+                    title='Payment method mix by channel/species and KPMD')
         st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("Digital adoption by county (Mobile or Both)")
         county = payment.copy()
-        county['digital'] = ((county['mobile']==1) | (county['both']==1)).astype(int)
+        county['digital'] = ((county['mobile'] == 1) | (county['both'] == 1)).astype(int)
         if 'County' in county.columns:
-            county_summary = county.groupby(['County','kpmd_registered'])[['digital']].mean().mul(100).reset_index()
-            county_summary['KPMD Status']=county_summary['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
-            fig2 = px.bar(county_summary, x='County', y='digital', color='KPMD Status', barmode='group', title='Digital share (%)')
-            st.plotly_chart(fig2, use_container_width=True)
+            county_summary = county.groupby(['County', 'kpmd_registered'])[['digital']].mean().mul(100).reset_index()
+            county_summary['KPMD Status'] = county_summary['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+            if county_summary['digital'].sum() == 0:
+                st.info("No digital payments found in the data.")
+            else:
+                fig2 = px.bar(county_summary, x='County', y='digital', color='KPMD Status',
+                            barmode='group', title='Digital share (%)')
+                st.plotly_chart(fig2, use_container_width=True)
         else:
             st.info("County column not available for county split")
 
@@ -1458,72 +1580,113 @@ def main():
     st.title("APMT Project Insights")
     st.markdown('<div class="main-header">Pastoral Market Transformation Monitoring</div>', unsafe_allow_html=True)
 
-    uploaded_file = st.file_uploader("Upload APMT Data CSV", type=['csv','tsv'])
-    if uploaded_file is not None:
-        try:
-            file_bytes = uploaded_file.getvalue()
-            # Try multiple encodings
-            encodings = ['utf-8', 'latin-1', 'ISO-8859-1', 'cp1252', 'windows-1252']
-            df = None
-            for encoding in encodings:
-                try:
-                    if uploaded_file.name.lower().endswith('.tsv'):
-                        df = pd.read_csv(io.BytesIO(file_bytes), encoding=encoding, sep='\t')
-                    else:
-                        df = pd.read_csv(io.BytesIO(file_bytes), encoding=encoding)
-                    st.success(f"Data loaded successfully: {len(df)} records ({encoding} encoding)")
-                    break
-                except (UnicodeDecodeError, pd.errors.EmptyDataError):
-                    continue
-            if df is None:
-                if uploaded_file.name.lower().endswith('.tsv'):
-                    df = pd.read_csv(io.BytesIO(file_bytes), encoding='utf-8', errors='replace', sep='\t')
-                else:
-                    df = pd.read_csv(io.BytesIO(file_bytes), encoding='utf-8', errors='replace')
-                st.success(f"Data loaded with character replacement: {len(df)} records")
-                st.warning("Some special characters were replaced due to encoding issues")
+    # --- Auto-load dataset (no uploader) ---
+    st.sidebar.header("Data Source")
+    st.sidebar.write("Auto-loaded file:")
+    st.sidebar.code(DATA_PATH)
 
-            with st.expander("Data Preview"):
-                st.write(f"Columns detected ({len(df.columns)}):")
-                st.write(list(df.columns))
-                st.write(f"Total records: {len(df)}")
-                st.dataframe(df.head(10))
+    # Reload button to clear cache and rerun
+    if st.sidebar.button("Reload data"):
+        load_apmt_csv.clear()  # clears @st.cache_data
+        st.sidebar.success("Cache cleared. Reloading…")
+        st.rerun()
 
-            # Initialize data processor and renderer
-            processor = APMTDataProcessor(df)
-            renderer = DashboardRenderer(processor)
+    try:
+        df = load_apmt_csv(DATA_PATH)
+        st.success(f"Data loaded successfully: {len(df):,} records")
 
-            # Sidebar filters
-            st.sidebar.header("Global Filters")
+        with st.expander("Data Preview", expanded=False):
+            st.write(f"Columns detected ({len(df.columns)}):")
+            st.write(list(df.columns))
+            st.write(f"Total records: {len(df)}")
+            st.dataframe(df.head(10))
 
+        # Initialize data processor and renderer
+        processor = APMTDataProcessor(df)
+        renderer = DashboardRenderer(processor)
+
+        # ---------- Sidebar: FILTERS (collapsed unless active) ----------
+        st.sidebar.header("Global Filters")
+
+        # Defaults for “inactive” state
+        county_default = 'All'
+        subcounty_default = 'All'
+        kpmd_default = 'All'
+        gender_default = 'All'
+
+        # Date defaults (full range on current data)
+        if 'int_date_std' in processor.df.columns:
+            _min_date = pd.to_datetime(processor.df['int_date_std'], errors='coerce').min()
+            _max_date = pd.to_datetime(processor.df['int_date_std'], errors='coerce').max()
+        else:
+            _min_date, _max_date = datetime(2024, 1, 1), datetime.today()
+
+        date_default = (
+            _min_date.date() if pd.notna(_min_date) else datetime(2024, 1, 1).date(),
+            _max_date.date() if pd.notna(_max_date) else datetime.today().date()
+        )
+
+        def _get_state(k, default):
+            return st.session_state.get(k, default)
+
+        # Open filters if any control is “active”
+        filters_active = (
+            _get_state('county', county_default) != county_default or
+            _get_state('subcounty', subcounty_default) != subcounty_default or
+            _get_state('kpmd_filter', kpmd_default) != kpmd_default or
+            _get_state('gender', gender_default) != gender_default or
+            (
+                isinstance(_get_state('date_range', date_default), tuple) and
+                _get_state('date_range', date_default) != date_default
+            )
+        )
+
+        with st.sidebar.expander("Select Here", expanded=filters_active):
+            # ----- County → Sub-County (cascading) -----
             if 'County' in processor.df.columns:
                 counties = ['All'] + sorted(processor.df['County'].dropna().unique())
-                selected_county = st.sidebar.selectbox("Select County", counties)
+                selected_county = st.selectbox("Select County", counties, key="county")
+
                 if selected_county != 'All':
                     processor.df = processor.df[processor.df['County'] == selected_county]
 
-            kpmd_filter = st.sidebar.selectbox("KPMD Status", ['All', 'Registered', 'Not Registered'])
+                    sub_col = coalesce_first(
+                        df,
+                        ['Sub County', 'Sub-County', 'Subcounty', 'Sub-county', 'SubCounty', 'Sub county']
+                    )
+                    if sub_col and sub_col in df.columns:
+                        sub_opts = ['All'] + sorted(
+                            df.loc[df['County'] == selected_county, sub_col].dropna().unique()
+                        )
+                        selected_sub = st.selectbox("Select Sub-County", sub_opts, key="subcounty")
+                        if selected_sub != 'All':
+                            processor.df = processor.df[processor.df[sub_col] == selected_sub]
+            else:
+                selected_county = 'All'
+
+            # ----- KPMD status -----
+            kpmd_filter = st.selectbox("KPMD Status", ['All', 'Registered', 'Not Registered'], key="kpmd_filter")
             if kpmd_filter == 'Registered':
                 processor.df = processor.df[processor.df['kpmd_registered'] == 1]
             elif kpmd_filter == 'Not Registered':
                 processor.df = processor.df[processor.df['kpmd_registered'] == 0]
 
+            # ----- Gender -----
             if 'Gender' in processor.df.columns:
                 genders = ['All'] + sorted(processor.df['Gender'].dropna().unique())
-                selected_gender = st.sidebar.selectbox("Select Gender", genders)
+                selected_gender = st.selectbox("Select Gender", genders, key="gender")
                 if selected_gender != 'All':
                     processor.df = processor.df[processor.df['Gender'] == selected_gender]
 
+            # ----- Date range -----
             if 'int_date_std' in processor.df.columns:
                 try:
-                    min_date = pd.to_datetime(processor.df['int_date_std']).min()
-                    max_date = pd.to_datetime(processor.df['int_date_std']).max()
-                    date_range = st.sidebar.date_input(
+                    date_range = st.date_input(
                         "Select Date Range",
-                        value=(min_date.date() if pd.notna(min_date) else datetime(2024,1,1).date(),
-                               max_date.date() if pd.notna(max_date) else datetime.today().date()),
-                        min_value=(min_date.date() if pd.notna(min_date) else datetime(2024,1,1).date()),
-                        max_value=(max_date.date() if pd.notna(max_date) else datetime.today().date())
+                        value=_get_state('date_range', date_default),
+                        min_value=date_default[0],
+                        max_value=date_default[1],
+                        key="date_range"
                     )
                     if isinstance(date_range, tuple) and len(date_range) == 2:
                         start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
@@ -1532,64 +1695,78 @@ def main():
                             (pd.to_datetime(processor.df['int_date_std'], errors='coerce') <= end)
                         ]
                 except Exception:
-                    st.sidebar.warning("Date filtering not available")
+                    st.warning("Date filtering not available")
 
-            # Navigation
-            st.sidebar.header("Dashboard Navigation")
-            page = st.sidebar.selectbox(
-                "Select Dashboard Page",
-                ["Field Outlook", "Pastoral Productivity", "Feed & Fodder",
-                 "Sheep Offtake", "Goat Offtake", "Payments", "P&L Analysis",
-                 "County Comparator", "Gender Inclusion", "Climate Impact"]
-            )
+        # ---------- Sidebar: NAVIGATION (ALWAYS VISIBLE, RED HEADER) ----------
+        st.sidebar.markdown(
+            '<div style="color:#dc3545; font-weight:700; font-size:1rem; margin-bottom:0.25rem;">'
+            'Navigate Here <span style="font-size:1.1rem; line-height:1;">👇</span>'
+            '</div>',
+            unsafe_allow_html=True
+        )
 
-            # Render
-            if page == "Field Outlook":
-                renderer.render_field_outlook()
-            elif page == "Pastoral Productivity":
-                renderer.render_pastoral_productivity()
-            elif page == "Feed & Fodder":
-                renderer.render_feed_fodder()
-            elif page == "Sheep Offtake":
-                renderer.render_offtake_analysis('sheep')
-            elif page == "Goat Offtake":
-                renderer.render_offtake_analysis('goats')
-            elif page == "Payments":
-                renderer.render_payments()
-            elif page == "P&L Analysis":
-                renderer.render_pl_analysis()
-            elif page == "County Comparator":
-                renderer.render_county_compare()
-            elif page == "Gender Inclusion":
-                renderer.render_gender_inclusion()
-            elif page == "Climate Impact":
-                renderer.render_climate_impact()
+        # Order with P&L Analysis LAST
+        pages = [
+            "Field Outlook",
+            "Pastoral Productivity",
+            "Feed & Fodder",
+            "Sheep Offtake",
+            "Goat Offtake",
+            "Payments",
+            "County Comparator",
+            "Gender Inclusion",
+            "Climate Impact",
+            "P&L Analysis",  # last
+        ]
 
-            # Export
-            st.sidebar.header("Data Export")
-            csv = processor.df.to_csv(index=False)
-            st.sidebar.download_button(
-                label="Download Filtered Data (CSV)",
-                data=csv,
-                file_name=f"apmt_filtered_data_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv"
-            )
+        if 'nav_page' not in st.session_state:
+            st.session_state['nav_page'] = "Field Outlook"
 
-        except Exception as e:
-            st.error(f"Error processing data: {str(e)}")
-            st.info("Please check that your CSV/TSV file matches the expected APMT data format")
-    else:
-        st.info("👆 Please upload an APMT data CSV/TSV file to begin")
-        st.subheader("Expected Data Structure")
-        st.markdown("""
-        Your file should contain these key columns (names may vary slightly; the app is flexible):
-        - Household identifiers: `Household ID`, `County`, `Gender`
-        - KPMD flag: `A8. Are you registered to KPMD programs?`
-        - Arm: `Selection of the household` (Treatment/Control)
-        - Dates: `int_date`, `_submission_time`, `start` or `end`
-        - GPS: `_GPS Coordinates_latitude`, `_GPS Coordinates_longitude`
-        - Sections B, C, D, E, G, J variables as described in the questionnaire
-        """)
+        page = st.sidebar.radio(
+            "Select Dashboard Page",
+            pages,
+            key="nav_page"
+        )
+
+        # Render
+        if page == "Field Outlook":
+            renderer.render_field_outlook()
+        elif page == "Pastoral Productivity":
+            renderer.render_pastoral_productivity()
+        elif page == "Feed & Fodder":
+            renderer.render_feed_fodder()
+        elif page == "Sheep Offtake":
+            renderer.render_offtake_analysis('sheep')
+        elif page == "Goat Offtake":
+            renderer.render_offtake_analysis('goats')
+        elif page == "Payments":
+            renderer.render_payments()
+        elif page == "County Comparator":
+            renderer.render_county_compare()
+        elif page == "Gender Inclusion":
+            renderer.render_gender_inclusion()
+        elif page == "Climate Impact":
+            renderer.render_climate_impact()
+        elif page == "P&L Analysis":
+            renderer.render_pl_analysis()
+
+        # Export
+        st.sidebar.header("Data Export")
+        csv = processor.df.to_csv(index=False)
+        st.sidebar.download_button(
+            label="Download Filtered Data (CSV)",
+            data=csv,
+            file_name=f"apmt_filtered_data_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+
+    except FileNotFoundError:
+        st.error("The specified data file was not found.")
+        st.code(DATA_PATH)
+        st.info("Please check the path or ensure the file exists at this location.")
+    except Exception as e:
+        st.error(f"Error processing data: {str(e)}")
+        st.info("Please check that your CSV file matches the expected APMT data format")
 
 if __name__ == "__main__":
     main()
