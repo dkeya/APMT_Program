@@ -145,16 +145,63 @@ def coalesce_first(df, candidates):
 # -------------------------------------------------
 # Data Loading (Auto)
 # -------------------------------------------------
-DATA_PATH = r"C:\Users\dkeya\Documents\SBS\2025\APMT\APMT_Longitudinal_Survey.csv"
+def _resolve_data_path() -> str:
+    """
+    Decide which CSV to load:
+    1) st.secrets['DATA_FILE'] if provided
+    2) URL query param ?data=...
+    3) common relative filenames in the repo
+    """
+    # 1) Secrets (Streamlit Cloud → Settings → Secrets)
+    try:
+        secret_path = st.secrets.get("DATA_FILE", "").strip()
+        if secret_path:
+            return secret_path
+    except Exception:
+        pass
+
+    # 2) Query param ?data=...
+    try:
+        qs = st.query_params  # Streamlit >=1.30
+        if "data" in qs and len(qs["data"]) > 0:
+            return qs["data"]
+    except Exception:
+        # older versions: st.experimental_get_query_params()
+        try:
+            qs = st.experimental_get_query_params()
+            if "data" in qs and len(qs["data"]) > 0:
+                return qs["data"][0]
+        except Exception:
+            pass
+
+    # 3) Known relative filenames (add any you use)
+    candidates = [
+        "APMT_Longitudinal_Survey.csv",
+        "data/APMT_Longitudinal_Survey.csv",
+        "apmt_data.csv",
+        "data/apmt_data.csv",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+
+    # 4) Last resort: keep your original local path if it exists (dev on Windows)
+    original = r"C:\Users\dkeya\Documents\SBS\2025\APMT\APMT_Longitudinal_Survey.csv"
+    if os.path.exists(original):
+        return original
+
+    # If nothing is found, return the first candidate (for error message)
+    return candidates[0]
+
+DATA_PATH = _resolve_data_path()
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_apmt_csv(path: str) -> pd.DataFrame:
     """
-    Robust CSV loader with multiple encodings and fallback character replacement.
-    Auto-detects delimiter when possible.
+    Robust CSV loader with multiple encodings and delimiter sniffing.
     """
     encodings = ['utf-8', 'utf-8-sig', 'cp1252', 'latin-1', 'ISO-8859-1', 'windows-1252']
-    # Try straightforward reads first
+    # Simple attempts
     for enc in encodings:
         try:
             return pd.read_csv(path, encoding=enc)
@@ -164,7 +211,7 @@ def load_apmt_csv(path: str) -> pd.DataFrame:
             raise
         except Exception:
             continue
-    # Try python engine with sep=None (delimiter sniff)
+    # Sniff delimiter
     for enc in encodings:
         try:
             return pd.read_csv(path, encoding=enc, sep=None, engine='python')
@@ -174,13 +221,12 @@ def load_apmt_csv(path: str) -> pd.DataFrame:
             raise
         except Exception:
             continue
-    # Final fallback with character replacement
+    # Fallback with replacement
     try:
         return pd.read_csv(path, encoding='utf-8', errors='replace')
     except FileNotFoundError:
         raise
     except Exception:
-        # As last resort try latin-1 with replacement
         return pd.read_csv(path, encoding='latin-1', errors='replace')
 
 # -------------------------------------------------
@@ -1583,7 +1629,7 @@ def main():
     # --- Auto-load dataset (no uploader) ---
     st.sidebar.header("Data Source")
     st.sidebar.write("Auto-loaded file:")
-    st.sidebar.code(DATA_PATH)
+    st.sidebar.code(os.path.abspath(DATA_PATH))
 
     # Reload button to clear cache and rerun
     if st.sidebar.button("Reload data"):
