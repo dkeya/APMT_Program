@@ -1,14 +1,3 @@
-# app.py — APMT Longitudinal Dashboard (auto-load + all requested integrations)
-# -----------------------------------------------------------------------------------------
-# Adds:
-# - Pastoral Livelihoods (below Pastoral Productivity) with Access to Markets (F1) and income segmentation
-# - KPMD Participation page (between Climate Impact and P&L Analysis)
-# - Food Security (rCSI – 30-day) page (with I1, insurance)
-# - Offtake: weights, breeds, non-KPMD buyer types
-# - Productivity bars with always-on numbers
-# - Herd Composition: % Male Stock added
-# - P&L revenues now counts × times × price; feed revenue included; segmented income columns
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -23,6 +12,7 @@ import re
 import io
 import os
 import warnings
+from collections import defaultdict
 
 warnings.filterwarnings('ignore')
 
@@ -62,6 +52,7 @@ st.markdown("""
     .warning-card { background-color: #fff3cd; padding: 1rem; border-radius: 10px; border-left: 4px solid #ffc107; }
     .profit-positive { color: #28a745; font-weight: bold; }
     .profit-negative { color: #dc3545; font-weight: bold; }
+    .lsm-note { font-size: 0.85rem; color: #555; margin-top: 0.25rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -104,6 +95,131 @@ def coalesce_first(df, candidates):
         if c in df.columns: return c
     return None
 
+# ---------- LSMeans utilities ----------
+def _design_matrix(df, y_col, group_col=None, controls=None, dropna=True):
+    if controls is None: controls = []
+    work = df.copy()
+
+    if y_col not in work.columns:
+        return None, None, {}
+    y = pd.to_numeric(work[y_col], errors='coerce')
+
+    cols_to_use = []
+    if group_col and group_col in work.columns:
+        cols_to_use.append(group_col)
+    for c in controls:
+        if c in work.columns and c != group_col:
+            cols_to_use.append(c)
+
+    X_parts = []
+    meta = {'intercept': True, 'group': None, 'group_levels': [], 'control_cols': []}
+
+    X_parts.append(pd.Series(1.0, index=work.index, name='Intercept'))
+
+    if group_col and group_col in work.columns:
+        g = work[group_col]
+        if pd.api.types.is_numeric_dtype(g) and set(pd.unique(g.dropna())) <= {0,1}:
+            g1 = pd.to_numeric(g, errors='coerce').fillna(0.0)
+            colname = f'{group_col}_1'
+            X_parts.append(pd.Series(g1, index=work.index, name=colname))
+            meta['group'] = group_col
+            meta['group_levels'] = [0,1]
+            meta['group_dummy_cols'] = {1: colname}
+        else:
+            g = g.astype('category')
+            dummies = pd.get_dummies(g, prefix=group_col, drop_first=True)
+            X_parts.append(dummies)
+            meta['group'] = group_col
+            levels = list(g.cat.categories)
+            meta['group_levels'] = levels
+            meta['group_dummy_cols'] = {}
+            for lvl in levels[1:]:
+                meta['group_dummy_cols'][lvl] = f"{group_col}_{lvl}"
+
+    for c in controls:
+        if c == group_col or c not in work.columns: continue
+        s = work[c]
+        if pd.api.types.is_numeric_dtype(s):
+            X_parts.append(pd.Series(pd.to_numeric(s, errors='coerce'), index=work.index, name=c))
+            meta['control_cols'].append(c)
+        else:
+            s = s.astype('category')
+            dummies = pd.get_dummies(s, prefix=c, drop_first=True)
+            if dummies.shape[1] > 0:
+                X_parts.append(dummies)
+                meta['control_cols'].extend(list(dummies.columns))
+
+    X = pd.concat(X_parts, axis=1)
+    data = pd.concat([y.rename('y'), X], axis=1)
+    if dropna:
+        data = data.dropna(axis=0, how='any')
+    if data.shape[0] < X.shape[1] + 1:
+        return None, None, {}
+    y_clean = data['y'].values.astype(float)
+    X_clean = data.drop(columns=['y']).values.astype(float)
+    meta['X_cols'] = list(data.drop(columns=['y']).columns)
+    meta['X_means'] = data.drop(columns=['y']).mean(axis=0).to_dict()
+    return y_clean, X_clean, meta
+
+def _ols_beta(y, X):
+    try:
+        beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+        return beta
+    except Exception:
+        return None
+
+def lsmeans_by_group(df, y_col, group_col, controls=None):
+    if controls is None: controls = []
+    if y_col not in df.columns or group_col not in df.columns:
+        try:
+            return df.groupby(group_col)[y_col].mean().to_dict()
+        except Exception:
+            return None
+    y, X, meta = _design_matrix(df, y_col, group_col, controls)
+    if y is None or X is None:
+        try:
+            return df.groupby(group_col)[y_col].mean().to_dict()
+        except Exception:
+            return None
+    beta = _ols_beta(y, X)
+    if beta is None:
+        try:
+            return df.groupby(group_col)[y_col].mean().to_dict()
+        except Exception:
+            return None
+
+    X_cols = meta['X_cols']
+    X_means = meta['X_means']
+    g = meta.get('group')
+    g_levels = meta.get('group_levels', [])
+    g_dummy_cols = meta.get('group_dummy_cols', {})
+
+    results = {}
+    for lvl in g_levels:
+        xbar = np.array([X_means.get(c, 0.0) for c in X_cols], dtype=float)
+        if g is not None:
+            if set(g_levels) <= {0,1}:
+                colname = g_dummy_cols.get(1, f"{g}_1")
+                if colname in X_cols:
+                    idx = X_cols.index(colname)
+                    xbar[idx] = 1.0 if lvl == 1 else 0.0
+            else:
+                for col in g_dummy_cols.values():
+                    if col in X_cols:
+                        xbar[X_cols.index(col)] = 0.0
+                if lvl in g_dummy_cols:
+                    colname = g_dummy_cols[lvl]
+                    if colname in X_cols:
+                        xbar[X_cols.index(colname)] = 1.0
+        results[lvl] = float(np.dot(xbar, beta))
+    return results
+
+def fmt_lsmean_note(lsm):
+    try:
+        return f'<div class="lsm-note">LSMean (adjusted): {lsm}</div>'
+    except Exception:
+        return ""
+
 # -------------------------------------------------
 # Data Loading (Auto)
 # -------------------------------------------------
@@ -130,11 +246,216 @@ def load_apmt_csv(path: str) -> pd.DataFrame:
     except Exception: return pd.read_csv(path, encoding='latin-1', errors='replace')
 
 # -------------------------------------------------
+# Data Cleaning, Validation & Quality (Merged, folded)
+# -------------------------------------------------
+def clean_and_validate(df: pd.DataFrame):
+    """
+    Returns: (clean_df, issues)
+    NOTE: we do not render UI here anymore; UI is in render_data_quality_section(...).
+    """
+    issues = []
+    work = df.copy()
+
+    # Strip whitespace from column names and string cells
+    work.columns = [re.sub(r'\s+', ' ', c).strip() for c in work.columns]
+    obj_cols = work.select_dtypes(include=['object']).columns.tolist()
+    for c in obj_cols:
+        work[c] = work[c].astype(str).str.strip().replace({'nan': np.nan, 'None': np.nan})
+
+    # Deduplicate exact rows
+    before = len(work)
+    work = work.drop_duplicates()
+    dupes_removed = before - len(work)
+    if dupes_removed > 0:
+        issues.append(f"Removed {dupes_removed} duplicate rows.")
+
+    # Coerce likely numeric columns by hint
+    numeric_hints = [
+        'price', 'cost', 'number', 'quantity', 'bales', 'weight', 'months', 'rate', 'total',
+        'insured', 'premium', 'revenue', 'times', 'transport', 'distance', 'profit', 'margin'
+    ]
+    for c in work.columns:
+        if any(h in c.lower() for h in numeric_hints):
+            work[c] = to_num(work[c])
+
+    # Harmonize dates
+    for c in ['int_date','_submission_time','start','end']:
+        if c in work.columns:
+            work[c] = pd.to_datetime(work[c], errors='coerce', infer_datetime_format=True)
+
+    # Range validations (collect warnings)
+    def add_issue(mask, msg, suggestion=None):
+        try:
+            cnt = int(pd.Series(mask).fillna(False).sum())
+        except Exception:
+            cnt = 0
+        if cnt > 0:
+            issues.append(f"{msg}: {cnt} rows" + (f" — {suggestion}" if suggestion else ""))
+
+    # GPS sanity
+    lat_col = coalesce_first(work, ['_GPS Coordinates_latitude','GPS Latitude','Latitude'])
+    lon_col = coalesce_first(work, ['_GPS Coordinates_longitude','GPS Longitude','Longitude'])
+    if lat_col and lon_col:
+        bad_lat = ~pd.to_numeric(work[lat_col], errors='coerce').between(-4.7, 5.0)
+        bad_lon = ~pd.to_numeric(work[lon_col], errors='coerce').between(33.0, 42.5)
+        add_issue(bad_lat | bad_lon, "Out-of-bounds GPS coordinates", "check data entry")
+
+    # Negative values checks
+    for c in work.columns:
+        cl = c.lower()
+        if any(k in cl for k in ['price','cost','revenue','premium','transport','profit','weight']):
+            bad = pd.to_numeric(work[c], errors='coerce') < 0
+            add_issue(bad.fillna(False), f"Negative values in '{c}'", "should be ≥ 0")
+
+    # Unrealistic weights
+    for c in work.columns:
+        if 'weight' in c.lower():
+            over = pd.to_numeric(work[c], errors='coerce') > 120
+            add_issue(over.fillna(False), f"Unusually large weights in '{c}'", "verify units (kg)")
+
+    # Missing key fields
+    if 'County' in work.columns:
+        add_issue(work['County'].isna() | (work['County'].astype(str).str.strip() == ''), "Missing County")
+
+    for c in ['County','Gender','month']:
+        if c in work.columns:
+            work[c] = work[c].astype('category')
+
+    return work, issues
+
+def _iqr_outlier_mask(s: pd.Series):
+    s = pd.to_numeric(s, errors='coerce')
+    q1, q3 = s.quantile(0.25), s.quantile(0.75)
+    iqr = q3 - q1
+    if pd.isna(iqr) or iqr == 0:
+        return pd.Series(False, index=s.index)
+    lower, upper = q1 - 1.5*iqr, q3 + 1.5*iqr
+    return (s < lower) | (s > upper)
+
+def render_data_quality_section(df: pd.DataFrame, issues: list):
+    """
+    Combined, folded section:
+    - Top: Validation issues list (warnings)
+    - Visuals: missingness, duplicates, outliers by column, and quick distributions
+    Always folded by default (expanded=False).
+    """
+    with st.expander("🧹 Data Quality Overview", expanded=False):
+        # ---- Issues / Validation report
+        if issues:
+            for it in issues:
+                st.warning(it)
+        else:
+            st.success("No major data validation issues detected.")
+
+        st.markdown("---")
+
+        # ---- Visual scan
+        st.subheader("Data Quality Overview (Visual)")
+
+        # Missingness (columns on the X axis)
+        try:
+            miss_pct = df.isna().mean().mul(100).sort_values(ascending=False)
+            miss_df_full = miss_pct.reset_index()
+            miss_df_full.columns = ['Column','Missing %']
+
+            # Plot ONLY columns with >0% missing
+            miss_df = miss_df_full[miss_df_full['Missing %'] > 0].copy()
+
+            if not miss_df.empty:
+                fig = px.bar(
+                    miss_df,
+                    x='Column',
+                    y='Missing %',
+                    title='Missing Data (%) by Column',
+                )
+                fig.update_traces(marker_line_width=0, hovertemplate="%{x}<br>%{y:.1f}%<extra></extra>")
+                fig.update_layout(
+                    xaxis={
+                        'categoryorder': 'total descending',
+                        'tickangle': -60,
+                        'automargin': True
+                    },
+                    yaxis={'rangemode': 'tozero'},
+                    bargap=0.15,
+                    height=min(1200, max(500, 20 * (len(miss_df) > 35) + 600)),  # a bit taller if many cols
+                    margin=dict(l=60, r=30, t=60, b=260)  # big bottom margin for rotated labels
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No missing values detected.")
+
+            # Full table (including 0% columns) for audit
+            with st.expander("Show full missingness table (includes 0%)", expanded=False):
+                st.dataframe(miss_df_full.reset_index(drop=True))
+        except Exception as e:
+            st.info(f"Missingness scan skipped: {e}")
+
+        # Duplicates
+        try:
+            dup_rows = int(df.duplicated().sum())
+            st.metric("Duplicate rows", f"{dup_rows:,}")
+        except Exception:
+            pass
+
+                # Outliers (numeric only)
+        try:
+            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            if num_cols:
+                # Build full counts (keep this complete for the table)
+                out_counts = []
+                for c in num_cols:
+                    mask = _iqr_outlier_mask(df[c])
+                    out_counts.append({'Column': c, 'Outliers': int(mask.sum())})
+                out_df = pd.DataFrame(out_counts).sort_values('Outliers', ascending=False)
+
+                # Plot ONLY non-zero outlier columns
+                nonzero = out_df[out_df['Outliers'] > 0].copy()
+
+                if not nonzero.empty:
+                    # horizontal bars scale better with long labels
+                    fig2 = px.bar(
+                        nonzero,
+                        y='Column',
+                        x='Outliers',
+                        orientation='h',
+                        title='Outlier Counts (numeric columns with >0 outliers)'
+                    )
+                    fig2.update_layout(
+                        height=min(1200, max(450, 18 * len(nonzero))),
+                        yaxis={'categoryorder': 'total ascending'}  # largest at top
+                    )
+                    st.plotly_chart(fig2, use_container_width=True)
+                else:
+                    st.info("No IQR-based outliers detected in numeric columns.")
+
+                # Full table (includes zeros) for reference
+                with st.expander("Show full outlier counts table (includes zero-outlier columns)", expanded=False):
+                    st.dataframe(out_df.reset_index(drop=True))
+        except Exception as e:
+            st.info(f"Outlier scan skipped: {e}")
+
+        # Quick distributions (lightweight; top few numeric cols by variance)
+        try:
+            if num_cols:
+                var_sorted = pd.Series({c: pd.to_numeric(df[c], errors='coerce').var() for c in num_cols}).sort_values(ascending=False)
+                top_plot = [c for c in var_sorted.index[:4] if c in df.columns]
+                if top_plot:
+                    st.caption("Quick distributions (top-variance numeric columns)")
+                    for c in top_plot:
+                        fig3 = px.histogram(df, x=c, nbins=30, title=f'Distribution — {c}')
+                        st.plotly_chart(fig3, use_container_width=True)
+        except Exception:
+            pass
+
+# -------------------------------------------------
 # Data Processor
 # -------------------------------------------------
 class APMTDataProcessor:
     def __init__(self, df):
-        self.df = df.copy()
+        # run cleaning/validation first (now returns (df, issues))
+        clean_df, issues = clean_and_validate(df)
+        self.df = clean_df
+        self.dq_issues = issues
         self._basic_cleanups()
         self.column_mapping = self._build_column_mapping()
         self.enhanced_standardize_data()
@@ -167,9 +488,9 @@ class APMTDataProcessor:
         mapping['fodder_purchase'] = coalesce_first(self.df, ['B5a. Did you purchase fodder in the last 1 month?'])
         mapping['feed_sources'] = self._find_columns_pattern(r'B5b\..*buy feeds')
         mapping['sheep_kpmd_sales'] = self._find_columns_pattern(r'^E1\..*sheep.*KPMD|^E1\.$')
-        mapping['goat_kpmd_sales'] = self._find_columns_pattern(r'^E2\..*goat.*KPMD|^E2\.$')
+        mapping['goat_kpmd_sales']  = self._find_columns_pattern(r'^E2\..*goat.*KPMD|^E2\.$')
         mapping['sheep_non_kpmd_sales'] = self._find_columns_pattern(r'^E3\..*sheep|^E3\.$')
-        mapping['goat_non_kpmd_sales'] = self._find_columns_pattern(r'^E4\..*goat|^E4\.$')
+        mapping['goat_non_kpmd_sales']  = self._find_columns_pattern(r'^E4\..*goat|^E4\.$')
         mapping['decision_making'] = coalesce_first(self.df, [
             'G1.Who in the household makes the decision for livestock sale?  [Select all that apply]',
             'G1.Who in the household makes the decision for livestock sale? [Select all that apply]'
@@ -186,8 +507,10 @@ class APMTDataProcessor:
         return mapping
 
     def _find_columns_pattern(self, pattern):
-        try: rx = re.compile(pattern, re.IGNORECASE)
-        except re.error: return []
+        try:
+            rx = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            return []
         return [c for c in self.df.columns if rx.search(c)]
 
     def enhanced_standardize_data(self):
@@ -201,7 +524,8 @@ class APMTDataProcessor:
                     self.df['int_date_std'] = parsed
                     self.df.loc[parsed.notna(), 'month'] = parsed.dt.to_period('M').astype(str)
                     self.df.loc[parsed.notna(), 'year'] = parsed.dt.year
-                    date_parsed = True; break
+                    date_parsed = True
+                    break
             if not date_parsed:
                 self.df['month'] = [f"2024-{i:02d}" for i in range(1, min(len(self.df)+1, 13))]
 
@@ -209,7 +533,9 @@ class APMTDataProcessor:
             self.df['kpmd_registered'] = self.df[kpmd_col].apply(yn).astype(int) if kpmd_col else 0
 
             arm_col = self.column_mapping['household_type']
-            self.df['is_treatment'] = (self.df[arm_col].astype(str).str.contains('Treatment', case=False, na=False).astype(int)) if arm_col else 0
+            self.df['is_treatment'] = (
+                self.df[arm_col].astype(str).str.contains('Treatment', case=False, na=False).astype(int)
+            ) if arm_col else 0
 
             for pat in [r'^C1\.', r'^C2\.', r'^D1\..*vaccinate', r'^D3\..*treat', r'^D4\..*deworm', r'^B5a\.', r'^B6a\.', r'^J1\.']:
                 for col in self._find_columns_pattern(pat):
@@ -221,7 +547,7 @@ class APMTDataProcessor:
                 r'D1a\..*vaccinated', r'D1b\..*cost.*vaccination', r'D3a\..*sick.*treated', r'D3b\..*cost.*treatment',
                 r'D4a\..*cost.*deworming',
                 r'^E[1-4][chi]\..*price|^E[1-4][bh]\..*(How many|times)|^E[1-4]f\..*weight|^E[1-4]g\..*weight|^E[1-4]h\..*transport',
-                r'^F1\.'  # distance to market
+                r'^F1\.'
             ]
             for pat in numeric_patterns:
                 for col in self._find_columns_pattern(pat):
@@ -248,7 +574,9 @@ class APMTDataProcessor:
     def enhanced_feed_calculation(self):
         price_col = coalesce_first(self.df, ['B5c. What was the price per 15 kg bale in the last 1 month?'])
         qty_col = coalesce_first(self.df, ['B5d. Number of 15 kg bales purchased in the last 1 month?'])
-        self.df['Feed_Expenditure'] = (to_num(self.df[price_col]).fillna(0) * to_num(self.df[qty_col]).fillna(0)) if price_col and qty_col else 0
+        self.df['Feed_Expenditure'] = (
+            to_num(self.df[price_col]).fillna(0) * to_num(self.df[qty_col]).fillna(0)
+        ) if price_col and qty_col else 0
 
     def enhanced_offtake_mapping(self):
         self.offtake_col_mapping = {}
@@ -275,30 +603,34 @@ class APMTDataProcessor:
 
     def calculate_climate_resilience(self):
         a_col = self.column_mapping.get('adaptation_measures')
-        if a_col: self.df['adaptation_score'] = self.df[a_col].apply(yn)
+        if a_col and a_col in self.df.columns: self.df['adaptation_score'] = self.df[a_col].apply(yn)
         if 'kpmd_registered' in self.df.columns: self.df['kpmd_resilience_bonus'] = self.df['kpmd_registered'] * 0.5
         components = [c for c in ['adaptation_score','kpmd_resilience_bonus'] if c in self.df.columns]
         if components: self.df['resilience_score'] = self.df[components].sum(axis=1)
 
     def calculate_food_security(self):
-        # Insurance / premiums
         ins_num = coalesce_first(self.df, ['Number of your small ruminants livestock  insured?'])
         ins_cost = coalesce_first(self.df, ['Cost of insurance premiums in Ksh?'])
         if ins_num: self.df['insured_sr'] = to_num(self.df[ins_num]).fillna(0)
         if ins_cost: self.df['insurance_premium'] = to_num(self.df[ins_cost]).fillna(0)
 
-        # Worry about food
         worry = coalesce_first(self.df, ['I1. In the past 30 days, did you worry that your household would not have enough food?'])
         if worry: self.df['food_worry'] = self.df[worry].apply(yn).astype(int)
 
-        # rCSI (30-day recall)
-        freq_map_30 = {
-            'never (0 days)': 0, 'rarely (1–3 days)': 2, 'rarely (1-3 days)': 2,
-            'sometimes (4–10 days)': 7, 'often (11–20 days)': 15, 'very often (21–30 days)': 25
+        freq_map_30_raw = {
+            'never (0 days)': 0,
+            'rarely (1–3 days)': 2, 'rarely (1-3 days)': 2, 'rarely (1 — 3 days)': 2,
+            'sometimes (4–10 days)': 7, 'sometimes (4-10 days)': 7,
+            'often (11–20 days)': 15, 'often (11-20 days)': 15,
+            'very often (21–30 days)': 25, 'very often (21-30 days)': 25,
         }
+        def _canon(s: str) -> str:
+            return re.sub(r'\s+', ' ', str(s).strip().lower().replace('–', '-').replace('—', '-'))
+        freq_map_30 = {_canon(k): v for k, v in freq_map_30_raw.items()}
+
         def map_freq(colname):
-            if colname not in self.df.columns: return pd.Series(0, index=self.df.index)
-            s = self.df[colname].astype(str).str.strip().str.lower()
+            if not colname or colname not in self.df.columns: return pd.Series(0, index=self.df.index)
+            s = self.df[colname].astype(str).map(_canon)
             return s.map(freq_map_30).fillna(0)
 
         c12 = coalesce_first(self.df, ['12. Did your household rely on less preferred or less expensive foods?'])
@@ -313,7 +645,6 @@ class APMTDataProcessor:
         d15 = map_freq(c15)
         d16 = map_freq(c16)
 
-        # Standard rCSI weights
         w12, w13, w14, w15, w16 = 1, 2, 1, 1, 3
         self.df['rcsi_30'] = (w12*d12 + w13*d13 + w14*d14 + w15*d15 + w16*d16)
 
@@ -390,9 +721,13 @@ class APMTDataProcessor:
     def calculate_pl_metrics(self):
         """Calculate Profit & Loss metrics incl. segmented incomes"""
         try:
+            # Default zero Series for safe broadcasting
+            z = pd.Series(0.0, index=self.df.index)
+
+            # Initialize totals
             self.df['total_revenue'] = 0.0
-            self.df['total_costs'] = 0.0
-            self.df['net_profit'] = 0.0
+            self.df['total_costs']   = 0.0
+            self.df['net_profit']    = 0.0
             self.df['profit_margin'] = 0.0
 
             revenue_components = []
@@ -457,10 +792,16 @@ class APMTDataProcessor:
             if revenue_components:
                 self.df['total_revenue'] = self.df[revenue_components].sum(axis=1)
 
-            # Segmented incomes for analysis pages
-            self.df['income_kpmd']     = self.df.get('sheep_kpmd_revenue', 0) + self.df.get('goat_kpmd_revenue', 0)
-            self.df['income_non_kpmd'] = self.df.get('sheep_non_kpmd_revenue', 0) + self.df.get('goat_non_kpmd_revenue', 0)
-            self.df['income_feed']     = self.df.get('fodder_revenue', 0)
+            # ---- Segmented incomes (force Series defaults) ----
+            sheep_k = self.df['sheep_kpmd_revenue']     if 'sheep_kpmd_revenue'     in self.df.columns else z
+            goat_k  = self.df['goat_kpmd_revenue']      if 'goat_kpmd_revenue'      in self.df.columns else z
+            sheep_n = self.df['sheep_non_kpmd_revenue'] if 'sheep_non_kpmd_revenue' in self.df.columns else z
+            goat_n  = self.df['goat_non_kpmd_revenue']  if 'goat_non_kpmd_revenue'  in self.df.columns else z
+            fodder  = self.df['fodder_revenue']         if 'fodder_revenue'         in self.df.columns else z
+
+            self.df['income_kpmd']     = sheep_k + goat_k
+            self.df['income_non_kpmd'] = sheep_n + goat_n
+            self.df['income_feed']     = fodder
 
             # -------- Costs --------
             cost_components = []
@@ -511,7 +852,9 @@ class APMTDataProcessor:
 
             self.df['net_profit'] = self.df['total_revenue'] - self.df['total_costs']
             valid_revenue = self.df['total_revenue'] > 0
-            self.df.loc[valid_revenue, 'profit_margin'] = (self.df.loc[valid_revenue, 'net_profit'] / self.df.loc[valid_revenue, 'total_revenue'] * 100)
+            self.df.loc[valid_revenue, 'profit_margin'] = (
+                self.df.loc[valid_revenue, 'net_profit'] / self.df.loc[valid_revenue, 'total_revenue'] * 100
+            )
 
             # Channel-level examples (sheep)
             if all(c in self.df.columns for c in ['sheep_kpmd_revenue','transport_costs']):
@@ -526,6 +869,18 @@ class APMTDataProcessor:
                 ).replace([np.inf,-np.inf],0).fillna(0)
         except Exception as e:
             st.warning(f"Some P&L metrics could not be calculated: {str(e)}")
+        finally:
+            # ---- SAFETY NET: guarantee presence of key columns to avoid KeyErrors downstream ----
+            must_have_float = [
+                'sheep_kpmd_revenue','goat_kpmd_revenue',
+                'sheep_non_kpmd_revenue','goat_non_kpmd_revenue',
+                'fodder_revenue','total_revenue','total_costs',
+                'net_profit','profit_margin',
+                'income_kpmd','income_non_kpmd','income_feed'
+            ]
+            for c in must_have_float:
+                if c not in self.df.columns:
+                    self.df[c] = 0.0
 
 # -------------------------------------------------
 # Dashboard Renderer
@@ -538,105 +893,154 @@ class DashboardRenderer:
     def df(self):
         return self.dp.df
 
+    def _controls_for_lsmeans(self, group_col=None):
+        candidates = ['County','Gender','total_sr','month']
+        return [c for c in candidates if c in self.df.columns and c != group_col]
+
     def create_comparison_cards(self, data, metric_col, title, format_str="{:.1f}"):
         try:
+            if metric_col not in data.columns:
+                st.info(f"Column '{metric_col}' not found in dataset.")
+                return
             kpmd_data = data[data['kpmd_registered'] == 1]
             non_kpmd_data = data[data['kpmd_registered'] == 0]
             col1, col2 = st.columns(2)
+            controls = self._controls_for_lsmeans(group_col='kpmd_registered')
+            lsm = lsmeans_by_group(data.dropna(subset=[metric_col]), metric_col, 'kpmd_registered', controls=controls) or {}
+
             with col1:
-                v = kpmd_data[metric_col].mean() if (metric_col in kpmd_data and len(kpmd_data) > 0) else 0
+                v = kpmd_data[metric_col].mean() if (metric_col in kpmd_data.columns and len(kpmd_data) > 0) else 0
+                txt = format_str.format(v if pd.notna(v) else 0)
                 st.markdown(f"""
                 <div class="metric-card kpmd-card">
                     <h4>KPMD Registered</h4>
-                    <h3>{format_str.format(v if pd.notna(v) else 0)}</h3>
+                    <h3>{txt}</h3>
                     <small>n={len(kpmd_data)}</small>
+                    {fmt_lsmean_note(format_str.format(lsm.get(1, v)) if isinstance(lsm, dict) else "")}
                 </div>
                 """, unsafe_allow_html=True)
+
             with col2:
-                v = non_kpmd_data[metric_col].mean() if (metric_col in non_kpmd_data and len(non_kpmd_data) > 0) else 0
+                v = non_kpmd_data[metric_col].mean() if (metric_col in non_kpmd_data.columns and len(non_kpmd_data) > 0) else 0
+                txt = format_str.format(v if pd.notna(v) else 0)
                 st.markdown(f"""
                 <div class="metric-card non-kpmd-card">
                     <h4>Non-KPMD</h4>
-                    <h3>{format_str.format(v if pd.notna(v) else 0)}</h3>
+                    <h3>{txt}</h3>
                     <small>n={len(non_kpmd_data)}</small>
+                    {fmt_lsmean_note(format_str.format(lsm.get(0, v)) if isinstance(lsm, dict) else "")}
                 </div>
                 """, unsafe_allow_html=True)
-        except Exception:
-            st.warning(f"Could not create comparison cards for {metric_col}")
+        except Exception as e:
+            st.warning(f"Could not create comparison cards for {metric_col}: {e}")
 
-    # ---------------- NEW: Pastoral Livelihoods ----------------
+    # ---------------- NEW: Pastoral Livelihoods (as tabs) ----------------
     def render_pastoral_livelihoods(self):
         st.header("🏠 Pastoral Livelihoods")
-
-        # Income segmentation (KPMD vs Non-KPMD vs Feed)
         self.dp.calculate_pl_metrics()
-        st.subheader("Household Income Segmentation (Monthly)")
-        if all(c in self.df.columns for c in ['income_kpmd','income_non_kpmd','income_feed']):
-            inc = self.df[['income_kpmd','income_non_kpmd','income_feed','kpmd_registered']].copy()
-            inc.rename(columns={
-                'income_kpmd':'KPMD Livestock Income',
-                'income_non_kpmd':'Non-KPMD Livestock Income',
-                'income_feed':'Feed Income'
-            }, inplace=True)
 
-            # Average composition
-            avg_comp = inc[['KPMD Livestock Income','Non-KPMD Livestock Income','Feed Income']].mean()
-            fig = px.pie(values=avg_comp.values, names=avg_comp.index, title='Average Household Income Mix')
-            st.plotly_chart(fig, use_container_width=True)
+        tab1, tab2, tab3 = st.tabs([
+            "Household Income Segmentation (Monthly)",
+            "Access to Markets",
+            "Price Information Access"
+        ])
 
-            # By KPMD registration
-            melted = inc.melt(id_vars=['kpmd_registered'], var_name='Income Type', value_name='KES')
-            grp = melted.groupby(['kpmd_registered','Income Type'])['KES'].mean().reset_index()
-            grp['KPMD Status'] = grp['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
-            fig2 = px.bar(grp, x='Income Type', y='KES', color='KPMD Status', barmode='group',
-                          title='Average Income by KPMD Registration')
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("Income components not available")
+        # --- Tab 1: Income Segmentation ---
+        with tab1:
+            st.subheader("Household Income Segmentation (Monthly)")
+            # ---- Ensure columns exist before slicing (belt-and-braces) ----
+            for c in ['income_kpmd','income_non_kpmd','income_feed','kpmd_registered']:
+                if c not in self.df.columns:
+                    self.df[c] = 0.0
 
-        # Access to markets (F1)
-        st.subheader("Access to Markets")
-        f1 = coalesce_first(self.df, ['F1. How far did you travel to sell small ruminants in Kilometers last month?'])
-        if f1:
-            self.create_comparison_cards(self.df, f1, "Distance to Market (km)", "{:.1f} km")
-            fig = px.histogram(self.df, x=f1, nbins=20, title='Distribution of Distance to Market (km)',
-                               labels={f1:'Distance (km)'})
-            st.plotly_chart(fig, use_container_width=True)
-            if 'kpmd_registered' in self.df.columns:
-                fig2 = px.box(self.df, x='kpmd_registered', y=f1, color='kpmd_registered',
-                              labels={'kpmd_registered':'KPMD Registered', f1:'Distance (km)'},
-                              title='Distance to Market by KPMD Registration')
+            try:
+                inc = self.df[['income_kpmd','income_non_kpmd','income_feed','kpmd_registered']].copy()
+                inc.rename(columns={
+                    'income_kpmd':'KPMD Livestock Income',
+                    'income_non_kpmd':'Non-KPMD Livestock Income',
+                    'income_feed':'Feed Income'
+                }, inplace=True)
+
+                avg_comp = inc[['KPMD Livestock Income','Non-KPMD Livestock Income','Feed Income']].mean()
+                fig = px.pie(values=avg_comp.values, names=avg_comp.index, title='Average Household Income Mix')
+                st.plotly_chart(fig, use_container_width=True)
+
+                melted = inc.melt(id_vars=['kpmd_registered'], var_name='Income Type', value_name='KES')
+                grp = melted.groupby(['kpmd_registered','Income Type'])['KES'].mean().reset_index()
+                grp['KPMD Status'] = grp['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
+                fig2 = px.bar(grp, x='Income Type', y='KES', color='KPMD Status', barmode='group',
+                        title='Average Income by KPMD Registration')
+                fig2.update_traces(text=grp['KES'].round(0), textposition='outside')
+                fig2.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("F1 distance to market not available in this dataset")
 
-        # Price information (F2) quick stat if present
-        st.subheader("Price Information Access")
-        f2 = coalesce_first(self.df, ['F2. Did you get information about livestock prices prior to selling in the last three months?'])
-        if f2:
-            tmp = self.df.copy()
-            tmp['price_info'] = tmp[f2].apply(yn).astype(int)
-            self.create_comparison_cards(tmp, 'price_info', 'Households Accessing Price Info', '{:.1%}')
-        else:
-            st.info("F2 (price information) not available")
+                controls = self._controls_for_lsmeans(group_col='kpmd_registered')
+                ls_notes = []
+                for inc_type, col in [('KPMD Livestock Income','income_kpmd'),
+                                    ('Non-KPMD Livestock Income','income_non_kpmd'),
+                                    ('Feed Income','income_feed')]:
+                    lsm = lsmeans_by_group(inc.dropna(subset=[inc_type]).assign(**{
+                        # map back to original column names for lsmeans
+                        col: inc[inc_type]
+                    }), col, 'kpmd_registered', controls=controls)
+                    if isinstance(lsm, dict):
+                        ls_notes.append(f"{inc_type} — LSMean KPMD: {lsm.get(1, np.nan):,.0f}, Non-KPMD: {lsm.get(0, np.nan):,.0f}")
+                if ls_notes:
+                    st.caption("Adjusted (LSMeans): " + " | ".join(ls_notes))
+            except KeyError as e:
+                st.warning(f"Error processing income segmentation: missing {list(e.args)}")
+
+        # --- Tab 2: Access to Markets ---
+        with tab2:
+            st.subheader("Access to Markets")
+            f1 = coalesce_first(self.df, ['F1. How far did you travel to sell small ruminants in Kilometers last month?'])
+            if f1:
+                try:
+                    self.create_comparison_cards(self.df, f1, "Distance to Market (km)", "{:.1f} km")
+                    fig = px.histogram(self.df, x=f1, nbins=20, title='Distribution of Distance to Market (km)',
+                                       labels={f1:'Distance (km)'})
+                    st.plotly_chart(fig, use_container_width=True)
+                    if 'kpmd_registered' in self.df.columns:
+                        fig2 = px.box(self.df, x='kpmd_registered', y=f1, color='kpmd_registered',
+                                      labels={'kpmd_registered':'KPMD Registered', f1:'Distance (km)'},
+                                      title='Distance to Market by KPMD Registration')
+                        st.plotly_chart(fig2, use_container_width=True)
+                except Exception as e:
+                    st.warning(f"Error processing Access to Markets: {e}")
+            else:
+                st.info("F1 distance to market not available in this dataset")
+
+        # --- Tab 3: Price Information Access ---
+        with tab3:
+            st.subheader("Price Information Access")
+            f2 = coalesce_first(self.df, ['F2. Did you get information about livestock prices prior to selling in the last three months?'])
+            if f2:
+                try:
+                    tmp = self.df.copy()
+                    tmp['price_info'] = tmp[f2].apply(yn).astype(int)
+                    self.create_comparison_cards(tmp, 'price_info', 'Households Accessing Price Info', '{:.1%}')
+                except Exception as e:
+                    st.warning(f"Error processing Price Information Access: {e}")
+            else:
+                st.info("F2 (price information) not available")
 
     # ---------------- KPMD Participation ----------------
     def render_kpmd_participation(self):
         st.header("🤝 KPMD Participation")
 
-        # A9 - months in program
         months_col = coalesce_first(self.df, ['A9. For how many months have you been participating in KPMD?'])
         if months_col:
             try:
                 tmp = to_num(self.df[months_col]).fillna(0)
-                st.metric("Average Months in KPMD", f"{tmp.mean():.1f} months")
+                st.metric("Average Months in KPMD", f"{tmp.mean():.1f}")
                 fig = px.histogram(self.df, x=months_col, title='Distribution of Months in KPMD',
                                    labels={months_col:'Months'}, nbins=10)
+                fig.update_traces(textposition='outside')
+                fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(fig, use_container_width=True)
             except Exception:
                 st.info("Could not parse A9 months")
 
-        # B1 Trainings
         st.subheader("B1. Trainings Received (last 1 month)")
         b1_stem = "B1. Have you received any of the following through KPMD in the past 1 month? (select all that apply)"
         b1_cols = [c for c in self.df.columns if c.startswith(b1_stem + "/")]
@@ -651,11 +1055,12 @@ class DashboardRenderer:
             dfp = pd.DataFrame(rows)
             fig = px.bar(dfp, x='Training', y='Rate', color='KPMD Status', barmode='group',
                          title='KPMD Trainings in last 1 month (%)')
+            fig.update_traces(text=dfp['Rate'].round(1), textposition='outside')
+            fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("B1 training option columns not found")
 
-        # B2 Interventions
         st.subheader("B2. Interventions Received (last 1 month)")
         b2_stem = "B2. Have you received any of the following through KPMD in the past 1 month? (select all that apply)"
         b2_cols = [c for c in self.df.columns if c.startswith(b2_stem + "/")]
@@ -670,6 +1075,8 @@ class DashboardRenderer:
             dfp = pd.DataFrame(rows)
             fig = px.bar(dfp, x='Intervention', y='Rate', color='KPMD Status', barmode='group',
                          title='KPMD Interventions in last 1 month (%)')
+            fig.update_traces(text=dfp['Rate'].round(1), textposition='outside')
+            fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("B2 intervention option columns not found")
@@ -687,6 +1094,11 @@ class DashboardRenderer:
             with col1:
                 avg_profit = self.df['net_profit'].mean()
                 st.metric("Average Net Profit (KES)", f"{(avg_profit if pd.notna(avg_profit) else 0):,.0f}")
+                if 'kpmd_registered' in self.df.columns:
+                    controls = self._controls_for_lsmeans(group_col='kpmd_registered')
+                    lsm = lsmeans_by_group(self.df.dropna(subset=['net_profit']), 'net_profit', 'kpmd_registered', controls)
+                    if isinstance(lsm, dict):
+                        st.caption(f"Adjusted (LSMean) — KPMD: {lsm.get(1, np.nan):,.0f} | Non-KPMD: {lsm.get(0, np.nan):,.0f}")
             with col2:
                 avg_margin = self.df['profit_margin'].mean()
                 st.metric("Average Profit Margin (%)", f"{(avg_margin if pd.notna(avg_margin) else 0):.1f}%")
@@ -721,17 +1133,17 @@ class DashboardRenderer:
                     fig = px.bar(county_profit, x='County', y='mean',
                                  title='Average Net Profit by County',
                                  labels={'mean': 'Average Net Profit (KES)'}, color='mean')
+                    fig.update_traces(text=county_profit['mean'].round(0), textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                     st.plotly_chart(fig, use_container_width=True)
 
         with tab2:
             st.subheader("Revenue Analysis")
-            # Composition by category (now includes segmented)
             revenue_cols = [c for c in self.df.columns if 'revenue' in c.lower() and c != 'total_revenue']
             if revenue_cols:
                 avg_comp = self.df[revenue_cols].mean().sort_values(ascending=False)
                 fig = px.pie(values=avg_comp.values, names=avg_comp.index, title='Average Revenue Composition')
                 st.plotly_chart(fig, use_container_width=True)
-            # Segmented income bar
             if all(c in self.df.columns for c in ['income_kpmd','income_non_kpmd','income_feed']):
                 comp = self.df[['income_kpmd','income_non_kpmd','income_feed']].mean().reset_index()
                 comp.columns = ['Source','KES']
@@ -739,6 +1151,8 @@ class DashboardRenderer:
                     'income_kpmd':'KPMD Livestock', 'income_non_kpmd':'Non-KPMD Livestock', 'income_feed':'Feed'
                 })
                 fig2 = px.bar(comp, x='Source', y='KES', title='Average Income by Source (All Households)')
+                fig2.update_traces(text=comp['KES'].round(0), textposition='outside')
+                fig2.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(fig2, use_container_width=True)
 
             if 'kpmd_registered' in self.df.columns:
@@ -746,6 +1160,8 @@ class DashboardRenderer:
                 rc['KPMD_Status'] = rc['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
                 fig = px.bar(rc, x='KPMD_Status', y='total_revenue', title='Average Revenue by KPMD Status',
                              labels={'total_revenue': 'Average Revenue (KES)'})
+                fig.update_traces(text=rc['total_revenue'].round(0), textposition='outside')
+                fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(fig, use_container_width=True)
 
         with tab3:
@@ -755,6 +1171,8 @@ class DashboardRenderer:
                 avg_cost = self.df[cost_cols].mean().sort_values(ascending=False)
                 fig = px.bar(avg_cost, title='Average Cost Composition',
                              labels={'value': 'Average Cost (KES)', 'index': 'Cost Category'})
+                fig.update_traces(text=avg_cost.round(0), textposition='outside')
+                fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(fig, use_container_width=True)
 
             st.subheader("Cost Efficiency")
@@ -788,6 +1206,8 @@ class DashboardRenderer:
                 fig = px.bar(ch_df, x='Channel', y='Profit_Margin', color='KPMD_Status',
                              title='Channel Profit Margins by KPMD Registration',
                              barmode='group', labels={'Profit_Margin': 'Profit Margin (%)'})
+                fig.update_traces(text=ch_df['Profit_Margin'].round(1), textposition='outside')
+                fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(fig, use_container_width=True)
 
             st.subheader("Breakeven Analysis")
@@ -800,6 +1220,8 @@ class DashboardRenderer:
                                     var_name='Status', value_name='Percentage')
                 fig = px.bar(melted, x='KPMD_Status', y='Percentage', color='Status',
                              title='Breakeven Status by KPMD Registration', barmode='stack')
+                fig.update_traces(text=melted['Percentage'].round(1), textposition='outside')
+                fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(fig, use_container_width=True)
 
     # ---------------- Field & Data Outlook ----------------
@@ -813,7 +1235,7 @@ class DashboardRenderer:
             if cand:
                 try: latest = pd.to_datetime(self.df[cand], errors='coerce').max()
                 except Exception: latest=None
-            st.metric("Latest Submission", latest.strftime("%Y-%m-%d") if pd.notna(latest) else "N/A")
+            st.metric("Latest Submission", latest.strftime("%Y-%m-%d") if (latest is not None and pd.notna(latest)) else "N/A")
         with col3: st.metric("Counties Covered", int(self.df['County'].nunique()) if 'County' in self.df.columns else 0)
         with col4: st.metric("KPMD Participants", int(self.df['kpmd_registered'].sum()) if 'kpmd_registered' in self.df.columns else 0)
 
@@ -853,6 +1275,8 @@ class DashboardRenderer:
             county_kpmd['kpmd_status'] = county_kpmd['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
             fig = px.bar(county_kpmd, x='County', y='count', color='kpmd_status',
                          title='Submissions by County and KPMD Status', barmode='group')
+            fig.update_traces(text=county_kpmd['count'], textposition='outside')
+            fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("County or KPMD data not available")
@@ -909,7 +1333,6 @@ class DashboardRenderer:
                 else:
                     st.info("Goat data not available")
 
-            # Female & Male stock percentages
             if 'pct_female' in self.df.columns:
                 st.write("**Percentage Female Stock**")
                 self.create_comparison_cards(self.df, 'pct_female', 'Female Stock %', '{:.1f}%')
@@ -927,6 +1350,8 @@ class DashboardRenderer:
                     melted['Species'] = melted['Species'].map({'total_sheep':'Sheep','total_goats':'Goats'})
                     fig = px.bar(melted, x='kpmd_status', y='Average Count', color='Species',
                                  title='Average Herd Composition by KPMD Status', barmode='group')
+                    fig.update_traces(text=melted['Average Count'].round(1), textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                     st.plotly_chart(fig, use_container_width=True)
                 except Exception:
                     st.info("Herd composition data not available")
@@ -973,6 +1398,8 @@ class DashboardRenderer:
                     dfp = pd.DataFrame(rows)
                     fig = px.bar(dfp, x='Disease', y='Rate', color='KPMD_Status',
                                  title='Vaccination Diseases by KPMD Status (%)', barmode='group')
+                    fig.update_traces(text=dfp['Rate'].round(1), textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                     st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("Vaccination disease data not available")
@@ -990,6 +1417,8 @@ class DashboardRenderer:
                     dfp = pd.DataFrame(rows)
                     fig = px.bar(dfp, x='Disease', y='Rate', color='KPMD_Status',
                                  title='Treatment Diseases by KPMD Status (%)', barmode='group')
+                    fig.update_traces(text=dfp['Rate'].round(1), textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                     st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("Treatment disease data not available")
@@ -1001,6 +1430,8 @@ class DashboardRenderer:
                     provider_counts['KPMD_Status'] = provider_counts['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
                     fig = px.bar(provider_counts, x='KPMD_Status', y='count', color=prov_col,
                                  title='Vaccination Providers by KPMD Status')
+                    fig.update_traces(text=provider_counts['count'], textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                     st.plotly_chart(fig, use_container_width=True)
                 except Exception:
                     st.info("Vaccination provider data not available")
@@ -1061,6 +1492,8 @@ class DashboardRenderer:
                 dfp = pd.DataFrame(rows)
                 fig = px.bar(dfp, x='Source', y='Rate', color='KPMD_Status',
                              title='Feed Purchase Sources by KPMD Status (%)', barmode='group')
+                fig.update_traces(text=dfp['Rate'].round(1), textposition='outside')
+                fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("Feed source data not available")
@@ -1169,6 +1602,12 @@ class DashboardRenderer:
                 fig = px.box(dfp, x='Channel', y='Price', color='KPMD_Status',
                              title=f'{title_species} Price Distribution by Channel and KPMD Registration')
                 st.plotly_chart(fig, use_container_width=True)
+                controls = self._controls_for_lsmeans(group_col='kpmd_registered')
+                for ch, col in [('KPMD', price_kpmd_col), ('Non-KPMD', price_non_col)]:
+                    if col in self.df.columns:
+                        lsm = lsmeans_by_group(self.df.dropna(subset=[col]), col, 'kpmd_registered', controls)
+                        if isinstance(lsm, dict):
+                            st.caption(f"{ch} price LSMean — KPMD: {lsm.get(1, np.nan):,.0f} | Non-KPMD: {lsm.get(0, np.nan):,.0f}")
             else:
                 st.info(f"Price data for {title_species} not available")
 
@@ -1230,6 +1669,8 @@ class DashboardRenderer:
             if not breed_df.empty:
                 figb = px.bar(breed_df, x='Breed', y='Rate', color='Channel',
                               barmode='group', title=f'{title_species} Breeds Sold by Channel (%)')
+                figb.update_traces(text=breed_df['Rate'].round(1), textposition='outside')
+                figb.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(figb, use_container_width=True)
             else:
                 st.info("Breed selection columns not available")
@@ -1244,6 +1685,8 @@ class DashboardRenderer:
                     rows.append({'Buyer': name, 'Rate': rate})
                 d_buy = pd.DataFrame(rows)
                 fig_buy = px.bar(d_buy, x='Buyer', y='Rate', title='Non-KPMD Buyer Mix (%)')
+                fig_buy.update_traces(text=d_buy['Rate'].round(1), textposition='outside')
+                fig_buy.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(fig_buy, use_container_width=True)
             else:
                 st.info("Buyer mix columns not available")
@@ -1259,7 +1702,10 @@ class DashboardRenderer:
             ('Sheep – Other', 'E3h. How were you paid by the non-KPMD off-takers last  month? [Select all that apply]'),
             ('Goats – Other', 'E4h. How were you paid by the non-KPMD off-takers  last  month? [Select all that apply]'),
         ]
-        rows = []; cols_norm = {_norm(c): c for c in self.df.columns}
+        rows = []; cols_norm = defaultdict(list)
+        for c in self.df.columns:
+            cols_norm[_norm(c)].append(c)
+
         for label, stem in stems:
             stem_n = _norm(stem)
             subcols = []
@@ -1271,6 +1717,9 @@ class DashboardRenderer:
                 suffix = _norm(c.split('/', 1)[1])
                 if ('mobile' in suffix) or ('m-pesa' in suffix) or ('mpesa' in suffix): mobile_cols.append(c)
                 if 'cash' in suffix: cash_cols.append(c)
+            cands = cols_norm.get(stem_n, [])
+            single_col = max(cands, key=len) if cands else None
+
             mobile_series = None; cash_series = None
             if mobile_cols:
                 mobile_series = (self.df[mobile_cols].astype(str).replace({'1':1,'0':0})
@@ -1278,16 +1727,14 @@ class DashboardRenderer:
             if cash_cols:
                 cash_series = (self.df[cash_cols].astype(str).replace({'1':1,'0':0})
                                .apply(pd.to_numeric, errors='coerce').fillna(0).max(axis=1))
-            if mobile_series is None or cash_series is None:
-                single_col = cols_norm.get(stem_n, None)
-                if single_col is not None:
-                    dummies = one_hot_multiselect(self.df[single_col])
-                    if mobile_series is None:
-                        tok = next((t for t in dummies.columns if _norm(t).startswith('mobile') or 'mpesa' in _norm(t)), None)
-                        mobile_series = dummies.get(tok, pd.Series(0, index=self.df.index))
-                    if cash_series is None:
-                        tok = next((t for t in dummies.columns if _norm(t).startswith('cash')), None)
-                        cash_series = dummies.get(tok, pd.Series(0, index=self.df.index))
+            if (mobile_series is None or cash_series is None) and (single_col is not None):
+                dummies = one_hot_multiselect(self.df[single_col])
+                if mobile_series is None:
+                    tok = next((t for t in dummies.columns if _norm(t).startswith('mobile') or 'mpesa' in _norm(t)), None)
+                    mobile_series = dummies.get(tok, pd.Series(0, index=self.df.index))
+                if cash_series is None:
+                    tok = next((t for t in dummies.columns if _norm(t).startswith('cash')), None)
+                    cash_series = dummies.get(tok, pd.Series(0, index=self.df.index))
             if mobile_series is None: mobile_series = pd.Series(0, index=self.df.index)
             if cash_series is None: cash_series = pd.Series(0, index=self.df.index)
 
@@ -1317,6 +1764,8 @@ class DashboardRenderer:
             st.warning("No non-zero payment shares detected. Check column names in your CSV."); return
         fig = px.bar(long, x='block', y='Share', color='Method', barmode='group', facet_col='KPMD Status',
                      title='Payment method mix by channel/species and KPMD')
+        fig.update_traces(text=long['Share'].round(1), textposition='outside')
+        fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
         st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("Digital adoption by county (Mobile or Both)")
@@ -1329,6 +1778,8 @@ class DashboardRenderer:
             else:
                 fig2 = px.bar(county_summary, x='County', y='digital', color='KPMD Status',
                               barmode='group', title='Digital share (%)')
+                fig2.update_traces(text=county_summary['digital'].round(1), textposition='outside')
+                fig2.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(fig2, use_container_width=True)
         else:
             st.info("County column not available for county split")
@@ -1389,6 +1840,8 @@ class DashboardRenderer:
                             st.metric(f"{r['KPMD_Status']} - Women Involvement", f"{r['Involvement_Rate']:.1f}%")
                         fig = px.bar(dfp, x='Role', y='Involvement_Rate', color='KPMD_Status',
                                      title='Decision Making Roles by KPMD Status (%)', barmode='group')
+                        fig.update_traces(text=dfp['Involvement_Rate'].round(1), textposition='outside')
+                        fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                         st.plotly_chart(fig, use_container_width=True)
                     else: st.info("No decision making data")
                 else: st.info("Decision making role columns not found")
@@ -1404,6 +1857,8 @@ class DashboardRenderer:
                     melted = ct.melt(id_vars=['Gender'], value_vars=['KPMD','Non-KPMD'], var_name='KPMD_Status', value_name='Percentage')
                     fig = px.bar(melted, x='Gender', y='Percentage', color='KPMD_Status',
                                  title='KPMD Participation by Gender (%)', barmode='stack')
+                    fig.update_traces(text=melted['Percentage'].round(1), textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                     st.plotly_chart(fig, use_container_width=True)
                     hh_head_col = self.dp.gender_columns.get('household_head','')
                     if hh_head_col and hh_head_col in self.df.columns:
@@ -1437,6 +1892,8 @@ class DashboardRenderer:
                             st.metric(f"{r['KPMD_Status']} - Women Control", f"{r['Control_Rate']:.1f}%")
                         fig = px.bar(dfp, x='Role', y='Control_Rate', color='KPMD_Status',
                                      title='Income Control Roles by KPMD Status (%)', barmode='group')
+                        fig.update_traces(text=dfp['Control_Rate'].round(1), textposition='outside')
+                        fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                         st.plotly_chart(fig, use_container_width=True)
                     else: st.info("No income control data")
                 else: st.info("Income control role columns not found")
@@ -1469,6 +1926,8 @@ class DashboardRenderer:
                 dfp = pd.DataFrame(rows)
                 fig = px.bar(dfp, x='Strategy', y='Usage_Rate', color='KPMD_Status',
                              title='Adaptation Strategies by KPMD Status (%)', barmode='group')
+                fig.update_traces(text=dfp['Usage_Rate'].round(1), textposition='outside')
+                fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(fig, use_container_width=True)
             elif j2_stem in self.df.columns:
                 dummies = one_hot_multiselect(self.df[j2_stem])
@@ -1480,6 +1939,8 @@ class DashboardRenderer:
                     fig = px.bar(agg, x='Strategy', y='flag', color='KPMD_Status',
                                  title='Adaptation Strategies by KPMD Status (%)', barmode='group')
                     fig.update_yaxes(title='Usage_Rate')
+                    fig.update_traces(text=agg['flag'].round(1), textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("Adaptation strategy data (J2) not available")
@@ -1504,6 +1965,8 @@ class DashboardRenderer:
                 dfp = pd.DataFrame(rows)
                 fig = px.bar(dfp, x='Barrier', y='Rate', color='KPMD_Status',
                              title='Barriers to Adaptation by KPMD Status (%)', barmode='group')
+                fig.update_traces(text=dfp['Rate'].round(1), textposition='outside')
+                fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(fig, use_container_width=True)
             elif j3_stem in base.columns:
                 dummies = one_hot_multiselect(base[j3_stem])
@@ -1515,6 +1978,8 @@ class DashboardRenderer:
                     fig = px.bar(agg, x='Barrier', y='flag', color='KPMD_Status',
                                  title='Barriers to Adaptation by KPMD Status (%)', barmode='group')
                     fig.update_yaxes(title='Rate')
+                    fig.update_traces(text=agg['flag'].round(1), textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("No barrier data available for non-adapting households")
@@ -1553,21 +2018,13 @@ class DashboardRenderer:
             col3.metric("Avg. # SR Insured", f"{self.df['insured_sr'].mean():.1f}")
 
         if 'rcsi_30' in self.df.columns:
-            fig = px.histogram(self.df, x='rcsi_30', nbins=20, title='Distribution of rCSI-30')
+            fig = px.histogram(self.df, x='rcsi_30', nbins=30, title='Distribution of rCSI (30 days)')
             st.plotly_chart(fig, use_container_width=True)
 
             if 'kpmd_registered' in self.df.columns:
                 fig2 = px.box(self.df, x='kpmd_registered', y='rcsi_30', color='kpmd_registered',
-                              labels={'kpmd_registered':'KPMD Registered', 'rcsi_30':'rCSI-30'},
-                              title='rCSI-30 by KPMD Registration')
+                              title='rCSI by KPMD Registration', labels={'kpmd_registered':'KPMD Registered'})
                 st.plotly_chart(fig2, use_container_width=True)
-
-        # Insurance premiums (if present)
-        if 'insurance_premium' in self.df.columns:
-            st.subheader("Insurance Premiums (KSH)")
-            self.create_comparison_cards(self.df, 'insurance_premium', 'Monthly Insurance Premiums', 'KES {:.0f}')
-
-    # ---------------- Payments/County/Gender renderers included above ----------------
 
 # -------------------------------------------------
 # Main App
@@ -1596,41 +2053,42 @@ def main():
             st.write(f"Total records: {len(df)}")
             st.dataframe(df.head(10))
 
+        # Build processor/renderer on the loaded df
         processor = APMTDataProcessor(df)
         renderer = DashboardRenderer(processor)
 
+        # NEW: Data Cleaning & Quality section (merged & folded)
+        render_data_quality_section(processor.df, processor.dq_issues)
+
         # ---------- Sidebar: FILTERS ----------
         st.sidebar.header("Global Filters")
+        # (kept exactly as before – “Select Here” expander + cascading filters)
 
         # --- Helper: compute date bounds from the CURRENT (unfiltered) df ---
         def _compute_date_bounds(df_for_bounds: pd.DataFrame):
-            # prefer columns with true timestamps
             for cand in ['int_date_std', '_submission_time', 'start', 'end']:
                 if cand in df_for_bounds.columns:
                     s = pd.to_datetime(df_for_bounds[cand], errors='coerce')
                     if s.notna().any():
                         return (s.min().date(), s.max().date(), cand)
-            # fallback to a sensible window if none found
             return (datetime(2024, 1, 1).date(), datetime.today().date(), None)
 
-        # Use the ORIGINAL df for bounds (not yet filtered), so defaults always cover the whole dataset
         _min_date, _max_date, _date_col_found = _compute_date_bounds(df)
+        if _min_date > _max_date:
+            _min_date, _max_date = _max_date, _min_date
 
-        # Build a simple signature for the dataset to detect changes (size + date bounds)
-        data_sig = (len(df), str(_min_date), str(_max_date))
+        head_hash = pd.util.hash_pandas_object(df.head(10), index=False).sum() if len(df) else 0
+        tail_hash = pd.util.hash_pandas_object(df.tail(10), index=False).sum() if len(df) else 0
+        data_sig = (len(df), str(_min_date), str(_max_date), int(head_hash), int(tail_hash))
 
-        # If there's no prior signature or the data changed: refresh default date range
         if st.session_state.get('data_sig') != data_sig:
             st.session_state['data_sig'] = data_sig
-            # Only reset to defaults if the user hasn't explicitly set a custom range
             if not st.session_state.get('date_range_is_custom', False):
                 st.session_state['date_range'] = (_min_date, _max_date)
 
-        # If we still don't have a date_range in session (first run), set it now
         if 'date_range' not in st.session_state:
             st.session_state['date_range'] = (_min_date, _max_date)
 
-        # Small utility: clamp any existing date_range to new dataset bounds
         def _clamp_to_bounds(dr_tuple):
             try:
                 a, b = dr_tuple
@@ -1644,11 +2102,9 @@ def main():
 
         st.session_state['date_range'] = _clamp_to_bounds(st.session_state['date_range'])
 
-        # ----- cascading filters -----
         def _get_state(k, default):
             return st.session_state.get(k, default)
 
-        # Open filters if any control is “active”
         county_default = 'All'
         subcounty_default = 'All'
         kpmd_default = 'All'
@@ -1667,7 +2123,6 @@ def main():
         )
 
         with st.sidebar.expander("Select Here", expanded=filters_active):
-
             # ----- County → Sub-County (cascading) -----
             if 'County' in processor.df.columns:
                 counties = ['All'] + sorted(processor.df['County'].dropna().unique())
@@ -1705,19 +2160,16 @@ def main():
                     processor.df = processor.df[processor.df['Gender'] == selected_gender]
 
             # ----- Date range -----
-            # mark user intent when they change the date
             def _mark_date_custom():
                 st.session_state['date_range_is_custom'] = True
 
             if _date_col_found is not None:
-                # Show a quick reset to full range
                 cols_reset = st.columns([1, 1.2, 2])
                 with cols_reset[0]:
                     if st.button("Reset dates"):
                         st.session_state['date_range'] = (_min_date, _max_date)
                         st.session_state['date_range_is_custom'] = False
 
-                # The widget itself
                 date_range = st.date_input(
                     "Select Date Range",
                     value=st.session_state['date_range'],
@@ -1727,7 +2179,6 @@ def main():
                     on_change=_mark_date_custom
                 )
 
-                # Apply to the filtered dataframe
                 if isinstance(date_range, tuple) and len(date_range) == 2:
                     start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
                     processor.df = processor.df[
@@ -1745,7 +2196,6 @@ def main():
             unsafe_allow_html=True
         )
 
-        # Order: add Pastoral Livelihoods after Pastoral Productivity; KPMD Participation between Climate Impact & P&L
         pages = [
             "Field Outlook",
             "Pastoral Productivity",
@@ -1759,7 +2209,7 @@ def main():
             "Climate Impact",
             "KPMD Participation",
             "Food Security (rCSI – 30d)",
-            "P&L Analysis",
+            "P&L Analysis",  # ← remains last
         ]
 
         if 'nav_page' not in st.session_state:
@@ -1793,16 +2243,6 @@ def main():
             renderer.render_food_security()
         elif page == "P&L Analysis":
             renderer.render_pl_analysis()
-
-        # Export
-        st.sidebar.header("Data Export")
-        csv = processor.df.to_csv(index=False)
-        st.sidebar.download_button(
-            label="Download Filtered Data (CSV)",
-            data=csv,
-            file_name=f"apmt_filtered_data_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
-        )
 
     except FileNotFoundError:
         st.error("The specified data file was not found.")
