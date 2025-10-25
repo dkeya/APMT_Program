@@ -349,9 +349,6 @@ def render_data_quality_section(df: pd.DataFrame, issues: list):
 
         st.markdown("---")
 
-        # ---- Visual scan
-        st.subheader("Data Quality Overview")
-
         # Missingness (columns on the X axis)
         try:
             miss_pct = df.isna().mean().mul(100).sort_values(ascending=False)
