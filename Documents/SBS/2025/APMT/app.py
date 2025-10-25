@@ -39,6 +39,12 @@ st.set_page_config(
 # -------------------------------------------------
 st.markdown("""
 <style>
+    /* Hide Streamlit's default UI chrome */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+
+    /* Your existing styles */
     .main-header {
         font-size: 2.5rem;
         color: #1f77b4;
