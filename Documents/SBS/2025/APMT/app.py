@@ -1601,67 +1601,141 @@ def main():
 
         # ---------- Sidebar: FILTERS ----------
         st.sidebar.header("Global Filters")
-        county_default = 'All'; subcounty_default = 'All'; kpmd_default = 'All'; gender_default = 'All'
 
-        if 'int_date_std' in processor.df.columns:
-            _min_date = pd.to_datetime(processor.df['int_date_std'], errors='coerce').min()
-            _max_date = pd.to_datetime(processor.df['int_date_std'], errors='coerce').max()
-        else:
-            _min_date, _max_date = datetime(2024,1,1), datetime.today()
-        date_default = (_min_date.date() if pd.notna(_min_date) else datetime(2024,1,1).date(),
-                        _max_date.date() if pd.notna(_max_date) else datetime.today().date())
+        # --- Helper: compute date bounds from the CURRENT (unfiltered) df ---
+        def _compute_date_bounds(df_for_bounds: pd.DataFrame):
+            # prefer columns with true timestamps
+            for cand in ['int_date_std', '_submission_time', 'start', 'end']:
+                if cand in df_for_bounds.columns:
+                    s = pd.to_datetime(df_for_bounds[cand], errors='coerce')
+                    if s.notna().any():
+                        return (s.min().date(), s.max().date(), cand)
+            # fallback to a sensible window if none found
+            return (datetime(2024, 1, 1).date(), datetime.today().date(), None)
 
-        def _get_state(k, default): return st.session_state.get(k, default)
+        # Use the ORIGINAL df for bounds (not yet filtered), so defaults always cover the whole dataset
+        _min_date, _max_date, _date_col_found = _compute_date_bounds(df)
+
+        # Build a simple signature for the dataset to detect changes (size + date bounds)
+        data_sig = (len(df), str(_min_date), str(_max_date))
+
+        # If there's no prior signature or the data changed: refresh default date range
+        if st.session_state.get('data_sig') != data_sig:
+            st.session_state['data_sig'] = data_sig
+            # Only reset to defaults if the user hasn't explicitly set a custom range
+            if not st.session_state.get('date_range_is_custom', False):
+                st.session_state['date_range'] = (_min_date, _max_date)
+
+        # If we still don't have a date_range in session (first run), set it now
+        if 'date_range' not in st.session_state:
+            st.session_state['date_range'] = (_min_date, _max_date)
+
+        # Small utility: clamp any existing date_range to new dataset bounds
+        def _clamp_to_bounds(dr_tuple):
+            try:
+                a, b = dr_tuple
+                a = max(_min_date, a)
+                b = min(_max_date, b)
+                if a > b:
+                    a, b = _min_date, _max_date
+                return (a, b)
+            except Exception:
+                return (_min_date, _max_date)
+
+        st.session_state['date_range'] = _clamp_to_bounds(st.session_state['date_range'])
+
+        # ----- cascading filters -----
+        def _get_state(k, default):
+            return st.session_state.get(k, default)
+
+        # Open filters if any control is “active”
+        county_default = 'All'
+        subcounty_default = 'All'
+        kpmd_default = 'All'
+        gender_default = 'All'
+        date_default = (_min_date, _max_date)
+
         filters_active = (
             _get_state('county', county_default) != county_default or
             _get_state('subcounty', subcounty_default) != subcounty_default or
             _get_state('kpmd_filter', kpmd_default) != kpmd_default or
             _get_state('gender', gender_default) != gender_default or
-            (isinstance(_get_state('date_range', date_default), tuple) and _get_state('date_range', date_default) != date_default)
+            (
+                isinstance(_get_state('date_range', date_default), tuple) and
+                _get_state('date_range', date_default) != date_default
+            )
         )
 
         with st.sidebar.expander("Select Here", expanded=filters_active):
+
+            # ----- County → Sub-County (cascading) -----
             if 'County' in processor.df.columns:
                 counties = ['All'] + sorted(processor.df['County'].dropna().unique())
                 selected_county = st.selectbox("Select County", counties, key="county")
+
                 if selected_county != 'All':
                     processor.df = processor.df[processor.df['County'] == selected_county]
-                    sub_col = coalesce_first(df, ['Sub County','Sub-County','Subcounty','Sub-county','SubCounty','Sub county'])
+
+                    sub_col = coalesce_first(
+                        df,
+                        ['Sub County', 'Sub-County', 'Subcounty', 'Sub-county', 'SubCounty', 'Sub county']
+                    )
                     if sub_col and sub_col in df.columns:
-                        sub_opts = ['All'] + sorted(df.loc[df['County'] == selected_county, sub_col].dropna().unique())
+                        sub_opts = ['All'] + sorted(
+                            df.loc[df['County'] == selected_county, sub_col].dropna().unique()
+                        )
                         selected_sub = st.selectbox("Select Sub-County", sub_opts, key="subcounty")
                         if selected_sub != 'All':
                             processor.df = processor.df[processor.df[sub_col] == selected_sub]
             else:
                 selected_county = 'All'
 
-            kpmd_filter = st.selectbox("KPMD Status", ['All','Registered','Not Registered'], key="kpmd_filter")
+            # ----- KPMD status -----
+            kpmd_filter = st.selectbox("KPMD Status", ['All', 'Registered', 'Not Registered'], key="kpmd_filter")
             if kpmd_filter == 'Registered':
                 processor.df = processor.df[processor.df['kpmd_registered'] == 1]
             elif kpmd_filter == 'Not Registered':
                 processor.df = processor.df[processor.df['kpmd_registered'] == 0]
 
+            # ----- Gender -----
             if 'Gender' in processor.df.columns:
                 genders = ['All'] + sorted(processor.df['Gender'].dropna().unique())
                 selected_gender = st.selectbox("Select Gender", genders, key="gender")
                 if selected_gender != 'All':
                     processor.df = processor.df[processor.df['Gender'] == selected_gender]
 
-            if 'int_date_std' in processor.df.columns:
-                try:
-                    date_range = st.date_input("Select Date Range",
-                                               value=_get_state('date_range', date_default),
-                                               min_value=date_default[0],
-                                               max_value=date_default[1],
-                                               key="date_range")
-                    if isinstance(date_range, tuple) and len(date_range)==2:
-                        start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
-                        processor.df = processor.df[
-                            (pd.to_datetime(processor.df['int_date_std'], errors='coerce') >= start) &
-                            (pd.to_datetime(processor.df['int_date_std'], errors='coerce') <= end)
-                        ]
-                except Exception:
-                    st.warning("Date filtering not available")
+            # ----- Date range -----
+            # mark user intent when they change the date
+            def _mark_date_custom():
+                st.session_state['date_range_is_custom'] = True
+
+            if _date_col_found is not None:
+                # Show a quick reset to full range
+                cols_reset = st.columns([1, 1.2, 2])
+                with cols_reset[0]:
+                    if st.button("Reset dates"):
+                        st.session_state['date_range'] = (_min_date, _max_date)
+                        st.session_state['date_range_is_custom'] = False
+
+                # The widget itself
+                date_range = st.date_input(
+                    "Select Date Range",
+                    value=st.session_state['date_range'],
+                    min_value=_min_date,
+                    max_value=_max_date,
+                    key="date_range",
+                    on_change=_mark_date_custom
+                )
+
+                # Apply to the filtered dataframe
+                if isinstance(date_range, tuple) and len(date_range) == 2:
+                    start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
+                    processor.df = processor.df[
+                        (pd.to_datetime(processor.df[_date_col_found], errors='coerce') >= start) &
+                        (pd.to_datetime(processor.df[_date_col_found], errors='coerce') <= end)
+                    ]
+            else:
+                st.info("No time information available for date filtering.")
 
         # ---------- Sidebar: NAVIGATION ----------
         st.sidebar.markdown(
