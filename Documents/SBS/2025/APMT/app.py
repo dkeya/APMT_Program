@@ -1309,35 +1309,200 @@ class DashboardRenderer:
         else:
             st.info("County or KPMD data not available")
 
+        # ---------------- Household Locations ----------------
         st.subheader("Household Locations")
-        lat_col, lon_col = '_GPS Coordinates_latitude', '_GPS Coordinates_longitude'
-        if lat_col in self.df.columns and lon_col in self.df.columns:
-            map_df = self.df.dropna(subset=[lat_col, lon_col]).copy()
-            map_df.rename(columns={lat_col:'lat', lon_col:'lon'}, inplace=True)
-            if 'kpmd_registered' in map_df.columns:
-                map_df['r'] = np.where(map_df['kpmd_registered'] == 1, 31, 214)
-                map_df['g'] = np.where(map_df['kpmd_registered'] == 1, 119, 39)
-                map_df['b'] = np.where(map_df['kpmd_registered'] == 1, 180, 40)
-            else:
-                map_df['r'], map_df['g'], map_df['b'] = 160, 160, 160
-            st.pydeck_chart(pdk.Deck(
-                map_style='mapbox://styles/mapbox/light-v9',
-                initial_view_state=pdk.ViewState(
-                    latitude=map_df['lat'].mean() if len(map_df) > 0 else -1.29,
-                    longitude=map_df['lon'].mean() if len(map_df) > 0 else 36.82,
-                    zoom=7, pitch=0
-                ),
-                layers=[pdk.Layer(
-                    "ScatterplotLayer",
-                    data=map_df,
-                    get_position='[lon, lat]',
-                    get_radius=900,
-                    get_fill_color='[r, g, b]',
-                    pickable=True
-                )]
-            ))
+
+        try:
+            import geopandas as gpd
+            from shapely.geometry import Point
+            import json
+            import pydeck as pdk
+            from pathlib import Path
+        except Exception:
+            st.info(
+                "To enable the interactive map, install:\n"
+                "  py -3 -m pip install geopandas shapely pydeck\n"
+                "Then rerun the app."
+            )
         else:
-            st.info("GPS coordinates not available for mapping")
+            lat_col = '_GPS Coordinates_latitude'
+            lon_col = '_GPS Coordinates_longitude'
+
+            if all(c in self.df.columns for c in (lat_col, lon_col)):
+                # 1) Points GDF
+                pts_df = self.df.dropna(subset=[lat_col, lon_col]).copy()
+                if len(pts_df) == 0:
+                    st.info("No GPS points to map.")
+                else:
+                    gdf_pts = gpd.GeoDataFrame(
+                        pts_df,
+                        geometry=gpd.points_from_xy(pts_df[lon_col].astype(float), pts_df[lat_col].astype(float)),
+                        crs="EPSG:4326",
+                    )
+
+                    # 2) Load county polygons (geoBoundaries)
+                    counties_path = Path("geo/kenya_counties.geojson")
+                    if not counties_path.exists():
+                        st.warning("Missing geo/kenya_counties.geojson. Run:  py -3 scripts\\fetch_kenya_geo.py")
+                    else:
+                        gdf_counties = gpd.read_file(counties_path).to_crs("EPSG:4326")
+                        name_col = "shapeName" if "shapeName" in gdf_counties.columns else gdf_counties.columns[0]
+
+                        # 3) Spatial join → farmer counts per county
+                        joined = gpd.sjoin(
+                            gdf_pts[["geometry"]],
+                            gdf_counties[[name_col, "geometry"]],
+                            predicate="within",
+                            how="left",
+                        )
+                        counts = joined.groupby(name_col).size().rename("farmers").reset_index()
+                        gdf_counties = gdf_counties.merge(counts, on=name_col, how="left").fillna({"farmers": 0})
+
+                        # 4) Build colors (OrRd-ish ramp)
+                        v = gdf_counties["farmers"].astype(float)
+                        vmin, vmax = float(v.min()), float(v.max())
+                        span = (vmax - vmin) if vmax > vmin else 1.0
+                        t = (v - vmin) / span
+                        # start (very light) → end (dark red)
+                        r0, g0, b0 = 254, 240, 217
+                        r1, g1, b1 = 165,  15,  21
+                        gdf_counties["r"] = (r0 + t * (r1 - r0)).round().clip(0,255).astype(int)
+                        gdf_counties["g"] = (g0 + t * (g1 - g0)).round().clip(0,255).astype(int)
+                        gdf_counties["b"] = (b0 + t * (b1 - b0)).round().clip(0,255).astype(int)
+
+                        # 5) Text anchor points for labels
+                        reps = gdf_counties.representative_point()
+                        gdf_labels = gpd.GeoDataFrame(
+                            {
+                                "name": gdf_counties[name_col].astype(str),
+                                "farmers": gdf_counties["farmers"].astype(int),
+                                "lon": reps.x,
+                                "lat": reps.y,
+                            },
+                            geometry=reps,
+                            crs="EPSG:4326",
+                        )
+                        gdf_labels["label"] = gdf_labels.apply(lambda r: f"{r['name']}\n{r['farmers']}", axis=1)
+
+                        # 6) Focus controls (better UX than a raw opacity slider)
+                        st.markdown("**Focus**")
+                        # vmax defined above from gdf_counties['farmers']; guaranteed float here
+                        max_count = int(vmax) if np.isfinite(vmax) else 0
+                        focus_mode = st.radio(
+                            "Highlight areas with data",
+                            ["Normal", "Dim areas below threshold", "Hide areas below threshold"],
+                            index=1,
+                            horizontal=True,
+                        )
+                        threshold = 0
+                        if max_count > 0 and focus_mode != "Normal":
+                            threshold = st.slider(
+                                "Minimum # of farmers to focus",
+                                0, max_count, max(1, int(round(max_count * 0.05)))
+                            )
+
+                        show_points = st.checkbox("Show household points", value=True)
+                        show_labels = st.checkbox("Show county labels", value=True)
+
+                        # 7) Prepare polygons according to focus mode
+                        gdf_c = gdf_counties.copy()
+
+                        if focus_mode == "Hide areas below threshold" and max_count > 0:
+                            gdf_c = gdf_c[gdf_c["farmers"] >= threshold].copy()
+                            # If everything got filtered out, fall back to original so we don't render a blank map
+                            if gdf_c.empty:
+                                gdf_c = gdf_counties.copy()
+                            gdf_c["a"] = 220  # solid fill for what remains
+                        elif focus_mode == "Dim areas below threshold" and max_count > 0:
+                            # Give high alpha (solid) to focused areas; dim the rest
+                            gdf_c["a"] = np.where(gdf_c["farmers"] >= threshold, 220, 40).astype(int)
+                        else:
+                            # Normal: uniform but still nicely visible
+                            gdf_c["a"] = 180
+
+                        # 8) Labels built from the SAME set used for the polygons after filtering
+                        reps = gdf_c.representative_point()
+                        gdf_labels = gpd.GeoDataFrame(
+                            {
+                                "name": gdf_c[name_col].astype(str),
+                                "farmers": gdf_c["farmers"].astype(int),
+                                "lon": reps.x,
+                                "lat": reps.y,
+                            },
+                            geometry=reps,
+                            crs="EPSG:4326",
+                        )
+                        gdf_labels["label"] = gdf_labels.apply(lambda r: f"{r['name']}\n{r['farmers']}", axis=1)
+
+                        # 9) Build layers
+                        layers = []
+
+                        # Choropleth polygons (use per-feature alpha 'a'; colors already computed)
+                        counties_geojson = json.loads(gdf_c.to_json())
+                        layers.append(
+                            pdk.Layer(
+                                "GeoJsonLayer",
+                                data=counties_geojson,
+                                stroked=True,
+                                filled=True,
+                                get_fill_color="[properties.r, properties.g, properties.b, properties.a]",
+                                get_line_color=[120, 120, 120, 180],
+                                line_width_min_pixels=0.8,
+                                pickable=True,
+                            )
+                        )
+
+                        # Labels (optional)
+                        if show_labels and not gdf_labels.empty:
+                            layers.append(
+                                pdk.Layer(
+                                    "TextLayer",
+                                    data=gdf_labels[["lon", "lat", "label"]].to_dict(orient="records"),
+                                    get_position="[lon, lat]",
+                                    get_text="label",
+                                    get_size=10,
+                                    get_color=[30, 30, 30],
+                                    get_alignment_baseline="'center'",
+                                    billboard=True,
+                                )
+                            )
+
+                        # Household points (optional)
+                        if show_points and not gdf_pts.empty:
+                            has_kpmd = "kpmd_registered" in gdf_pts.columns
+                            data_pts = gdf_pts.assign(
+                                r=lambda d: d["kpmd_registered"].map({1: 31, 0: 214}) if has_kpmd else 160,
+                                g=lambda d: d["kpmd_registered"].map({1:119, 0:  39}) if has_kpmd else 160,
+                                b=lambda d: d["kpmd_registered"].map({1:180, 0:  40}) if has_kpmd else 160,
+                                lon=lambda d: d.geometry.x,
+                                lat=lambda d: d.geometry.y,
+                            )
+                            layers.append(
+                                pdk.Layer(
+                                    "ScatterplotLayer",
+                                    data=data_pts[["lon", "lat", "r", "g", "b"]].to_dict(orient="records"),
+                                    get_position="[lon, lat]",
+                                    get_radius=700,
+                                    get_fill_color="[r, g, b, 200]",
+                                    pickable=True,
+                                )
+                            )
+
+                        # 10) Kenya-centric view — fit to the possibly filtered polygons to reinforce the focus
+                        bounds = gdf_c.total_bounds  # [minx, miny, maxx, maxy]
+                        cx = float((bounds[0] + bounds[2]) / 2)
+                        cy = float((bounds[1] + bounds[3]) / 2)
+                        view_state = pdk.ViewState(latitude=cy, longitude=cx, zoom=5.6, pitch=0, bearing=0)
+
+                        # 11) Render
+                        st.pydeck_chart(
+                            pdk.Deck(
+                                map_style="mapbox://styles/mapbox/light-v9",
+                                initial_view_state=view_state,
+                                layers=layers,
+                                tooltip={"text": "{name}\nFarmers: {farmers}"},
+                            )
+                        )
 
     # ---------------- Pastoral Productivity ----------------
     def render_pastoral_productivity(self):
