@@ -2251,6 +2251,7 @@ def main():
                 st.info("No time information available for date filtering.")
 
         # ---------- Sidebar: NAVIGATION ----------
+        # ---------- Sidebar: NAVIGATION ----------
         st.sidebar.markdown(
             '<div style="color:#dc3545; font-weight:700; font-size:1rem; margin-bottom:0.25rem;">'
             'Navigate Here <span style="font-size:1.1rem; line-height:1;">👇</span>'
@@ -2258,7 +2259,8 @@ def main():
             unsafe_allow_html=True
         )
 
-        pages = [
+        # Main pages list (P&L Analysis is intentionally NOT included here)
+        MAIN_PAGES = [
             "Field Outlook",
             "Pastoral Productivity",
             "Pastoral Livelihoods",
@@ -2271,14 +2273,40 @@ def main():
             "Climate Impact",
             "KPMD Participation",
             "Food Security (rCSI – 30d)",
-            "P&L Analysis",  # ← remains last
         ]
 
-        if 'nav_page' not in st.session_state:
-            st.session_state['nav_page'] = "Field Outlook"
-        page = st.sidebar.radio("Select Dashboard Page", pages, key="nav_page")
+        # Defaults
+        if "nav_page" not in st.session_state:
+            st.session_state["nav_page"] = "Field Outlook"
+        if "nav_page_radio" not in st.session_state:
+            st.session_state["nav_page_radio"] = "Field Outlook"
 
-        # Render
+        # Radio for the standard pages (excludes P&L Analysis)
+        selected_from_radio = st.sidebar.radio(
+            "Select Dashboard Page",
+            MAIN_PAGES,
+            key="nav_page_radio"
+        )
+
+        # If user is not currently on P&L Analysis, keep nav_page in sync with the radio
+        if st.session_state.get("nav_page") != "P&L Analysis":
+            st.session_state["nav_page"] = selected_from_radio
+
+        # Separate, top-level entry for P&L Analysis (same level as the radio label)
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### 📊 P&L Analysis")
+        if st.sidebar.button("Open P&L Analysis", use_container_width=True):
+            st.session_state["nav_page"] = "P&L Analysis"
+
+        # Optional: while on P&L Analysis, show a quick way back to the radio pages
+        if st.session_state.get("nav_page") == "P&L Analysis":
+            def _back_to_pages():
+                st.session_state["nav_page"] = st.session_state.get("nav_page_radio", MAIN_PAGES[0])
+            st.sidebar.button("← Back to pages", on_click=_back_to_pages, use_container_width=True)
+
+        # ---- Render the chosen page ----
+        page = st.session_state["nav_page"]
+
         if page == "Field Outlook":
             renderer.render_field_outlook()
         elif page == "Pastoral Productivity":
