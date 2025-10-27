@@ -2294,7 +2294,7 @@ def main():
 
         # Separate, top-level entry for P&L Analysis (same level as the radio label)
         st.sidebar.markdown("---")
-        st.sidebar.markdown("### 📊 P&L Analysis")
+        st.sidebar.markdown("### 💰 P&L Analysis")
         if st.sidebar.button("Open P&L Analysis", use_container_width=True):
             st.session_state["nav_page"] = "P&L Analysis"
 
