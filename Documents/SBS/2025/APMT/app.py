@@ -892,7 +892,15 @@ class DashboardRenderer:
 
     def _controls_for_lsmeans(self, group_col=None):
         candidates = ['County','Gender','total_sr','month']
-        return [c for c in candidates if c in self.df.columns and c != group_col]
+        return [c for c in self.df.columns if c in self.df.columns and c != group_col]
+
+    def _with_kpmd_status(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Return a copy with a categorical 'KPMD Status' column for clean legends/axes."""
+        df = data.copy()
+        if 'kpmd_registered' in df.columns:
+            df['KPMD Status'] = df['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+            df['KPMD Status'] = pd.Categorical(df['KPMD Status'], categories=['Non-KPMD', 'KPMD'], ordered=True)
+        return df
 
     def create_comparison_cards(self, data, metric_col, title, format_str="{:.1f}"):
         try:
@@ -1110,16 +1118,32 @@ class DashboardRenderer:
 
             st.subheader("Profit Distribution")
             col1, col2 = st.columns(2)
+
+            # Left: keep the histogram as-is
             with col1:
-                fig = px.histogram(self.df, x='net_profit', title='Distribution of Net Profit', labels={'net_profit': 'Net Profit (KES)'})
+                fig = px.histogram(
+                    self.df,
+                    x='net_profit',
+                    title='Distribution of Net Profit',
+                    labels={'net_profit': 'Net Profit (KES)'}
+                )
                 fig.update_layout(bargap=0.1)
                 st.plotly_chart(fig, use_container_width=True)
+
+            # Right: Box by clean Registration labels
             with col2:
                 if 'kpmd_registered' in self.df.columns:
-                    fig = px.box(self.df, x='kpmd_registered', y='net_profit',
-                                 title='Profit Distribution by KPMD Status',
-                                 labels={'kpmd_registered': 'KPMD Registered', 'net_profit': 'Net Profit (KES)'},
-                                 color='kpmd_registered')
+                    tmp = self._with_kpmd_status(self.df)
+                    fig = px.box(
+                        tmp,
+                        x='KPMD Status',
+                        y='net_profit',
+                        color='KPMD Status',
+                        category_orders={'KPMD Status': ['Non-KPMD', 'KPMD']},
+                        title='Profit Distribution by Registration',
+                        labels={'KPMD Status': 'Registration', 'net_profit': 'Net Profit (KES)'}
+                    )
+                    fig.update_layout(legend_title_text='Registration')
                     st.plotly_chart(fig, use_container_width=True)
 
             if 'County' in self.df.columns:
@@ -2005,6 +2029,7 @@ class DashboardRenderer:
     def render_food_security(self):
         st.header("🍚 Food Security — Reduced Coping Strategies Index (30-day)")
 
+        # Top summary metrics
         col1, col2, col3 = st.columns(3)
         if 'rcsi_30' in self.df.columns:
             col1.metric("Average rCSI-30", f"{self.df['rcsi_30'].mean():.1f}")
@@ -2014,14 +2039,47 @@ class DashboardRenderer:
         if 'insured_sr' in self.df.columns:
             col3.metric("Avg. # SR Insured", f"{self.df['insured_sr'].mean():.1f}")
 
+        # Overall rCSI distribution
         if 'rcsi_30' in self.df.columns:
             fig = px.histogram(self.df, x='rcsi_30', nbins=30, title='Distribution of rCSI (30 days)')
             st.plotly_chart(fig, use_container_width=True)
 
-            if 'kpmd_registered' in self.df.columns:
-                fig2 = px.box(self.df, x='kpmd_registered', y='rcsi_30', color='kpmd_registered',
-                              title='rCSI by KPMD Registration', labels={'kpmd_registered':'KPMD Registered'})
-                st.plotly_chart(fig2, use_container_width=True)
+        # ---------------- rCSI by Registration (30-day) ---------------- 
+        st.subheader("🍚 Food Security — Reduced Coping Strategies Index (30-day)")
+
+        if 'rcsi_30' in self.df.columns and 'kpmd_registered' in self.df.columns:
+            df_rcsi = self.df[['rcsi_30', 'kpmd_registered']].copy()
+            df_rcsi = df_rcsi[df_rcsi['rcsi_30'].notna()]
+            if len(df_rcsi) == 0:
+                st.info("No rCSI values available.")
+                return
+
+            # Add clean categorical for legend/axis
+            df_rcsi = self._with_kpmd_status(df_rcsi)
+
+            # Summary cards
+            colA, colB = st.columns(2)
+            with colA:
+                m = df_rcsi[df_rcsi['KPMD Status'] == 'KPMD']['rcsi_30'].mean()
+                st.metric("KPMD — Avg rCSI (30d)", f"{m:.1f}" if pd.notna(m) else "N/A")
+            with colB:
+                m = df_rcsi[df_rcsi['KPMD Status'] == 'Non-KPMD']['rcsi_30'].mean()
+                st.metric("Non-KPMD — Avg rCSI (30d)", f"{m:.1f}" if pd.notna(m) else "N/A")
+
+            # Box plot with ordered categories
+            fig2 = px.box(
+                df_rcsi,
+                x='KPMD Status',
+                y='rcsi_30',
+                color='KPMD Status',
+                category_orders={'KPMD Status': ['Non-KPMD', 'KPMD']},
+                labels={'KPMD Status': 'Registration', 'rcsi_30': 'rCSI (30-day)'},
+                title='rCSI by Registration'
+            )
+            fig2.update_layout(legend_title_text='Registration')
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.info("Missing rCSI or registration fields to plot rCSI by Registration.")
 
 # -------------------------------------------------
 # Main App
