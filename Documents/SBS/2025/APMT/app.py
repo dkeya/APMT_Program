@@ -716,91 +716,113 @@ class APMTDataProcessor:
                 if col not in self.df.columns: self.df[col] = 0.0
 
     def calculate_pl_metrics(self):
-        """Calculate Profit & Loss metrics incl. segmented incomes"""
+        """
+        Calculate Profit & Loss metrics with robust column detection.
+
+        Revenue now follows your rule strictly:
+        Household Income = (sheep_qty × sheep_price) + (goat_qty × goat_price)
+        computed separately for KPMD and Non-KPMD channels (no 'times' multiplier).
+
+        Also records which columns were used in self._income_debug for quick inspection.
+        """
         try:
-            # Default zero Series for safe broadcasting
             z = pd.Series(0.0, index=self.df.index)
+            self._income_debug = {}  # for UI debugging
 
-            # Initialize totals
-            self.df['total_revenue'] = 0.0
-            self.df['total_costs']   = 0.0
-            self.df['net_profit']    = 0.0
-            self.df['profit_margin'] = 0.0
+            def _pick_qty_price(species: str, kpmd: bool):
+                # species: 'sheep' or 'goat'; kpmd: True for KPMD (E1/E2), False for Non-KPMD (E3/E4)
+                if species == 'sheep' and kpmd:
+                    qty_exact  = ['E1a. How many sheep did you sell to KPMD off-takers  last month?']
+                    qty_pats   = [r'^E1a\..*(how many|number).*(sheep).*sell.*KPMD', r'^E1\..*how many.*sheep.*KPMD']
+                    price_exact= ['E1c. What was the average price per sheep last month?']
+                    price_pats = [r'^E1c\..*(average|avg).*price.*sheep', r'^E1\..*price.*sheep.*KPMD']
+                elif species == 'goat' and kpmd:
+                    qty_exact  = ['E2a. How many goats did you sell to KPMD off-takers  last month?']
+                    qty_pats   = [r'^E2a\..*(how many|number).*(goat).*sell.*KPMD', r'^E2\..*how many.*goat.*KPMD']
+                    price_exact= ['E2c. What was the average price per goat last month?']
+                    price_pats = [r'^E2c\..*(average|avg).*price.*goat', r'^E2\..*price.*goat.*KPMD']
+                elif species == 'sheep' and not kpmd:
+                    qty_exact  = ['E3b. How many sheep did you sell to non-KPMD off-takers  last month?']
+                    qty_pats   = [r'^E3b\..*(how many|number).*(sheep).*sell.*non.*KPMD', r'^E3\..*how many.*sheep.*non']
+                    price_exact= ['E3d. What was the average price per sheep last month?']
+                    price_pats = [r'^E3d\..*(average|avg).*price.*sheep', r'^E3\..*price.*sheep.*non']
+                else:  # goats, non-KPMD
+                    qty_exact  = ['E4b. How many goats did you sell to non-KPMD off-takers  last month?']
+                    qty_pats   = [r'^E4b\..*(how many|number).*(goat).*sell.*non.*KPMD', r'^E4\..*how many.*goat.*non']
+                    price_exact= ['E4d. What was the average price per goat last month?']
+                    price_pats = [r'^E4d\..*(average|avg).*price.*goat', r'^E4\..*price.*goat.*non']
 
-            revenue_components = []
+                # exact match first
+                qty_col = next((c for c in qty_exact if c in self.df.columns), None)
+                price_col = next((c for c in price_exact if c in self.df.columns), None)
 
-            # -------- Revenue: counts × times × price --------
-            # Sheep KPMD
-            if all(c in self.df.columns for c in [
-                    'E1a. How many sheep did you sell to KPMD off-takers  last month?',
-                    'E1b. How many times did you sell sheep to KPMD off-takers last month?',
-                    'E1c. What was the average price per sheep last month?']):
-                self.df['sheep_kpmd_revenue'] = (
-                    to_num(self.df['E1a. How many sheep did you sell to KPMD off-takers  last month?']).fillna(0) *
-                    to_num(self.df['E1b. How many times did you sell sheep to KPMD off-takers last month?']).fillna(0) *
-                    to_num(self.df['E1c. What was the average price per sheep last month?']).fillna(0)
-                )
-                revenue_components.append('sheep_kpmd_revenue')
+                # regex fallback
+                if qty_col is None:
+                    for pat in qty_pats:
+                        hits = [c for c in self.df.columns if re.search(pat, c, flags=re.IGNORECASE)]
+                        if hits:
+                            qty_col = hits[0]
+                            break
+                if price_col is None:
+                    for pat in price_pats:
+                        hits = [c for c in self.df.columns if re.search(pat, c, flags=re.IGNORECASE)]
+                        if hits:
+                            price_col = hits[0]
+                            break
+                return qty_col, price_col
 
-            # Goats KPMD
-            if all(c in self.df.columns for c in [
-                    'E2a. How many goats did you sell to KPMD off-takers  last month?',
-                    'E2b. How many times did you sell goats to KPMD off-takers  last month?',
-                    'E2c. What was the average price per goat last month?']):
-                self.df['goat_kpmd_revenue'] = (
-                    to_num(self.df['E2a. How many goats did you sell to KPMD off-takers  last month?']).fillna(0) *
-                    to_num(self.df['E2b. How many times did you sell goats to KPMD off-takers  last month?']).fillna(0) *
-                    to_num(self.df['E2c. What was the average price per goat last month?']).fillna(0)
-                )
-                revenue_components.append('goat_kpmd_revenue')
+            # ---- Revenue sources (strict qty × price, no “times”) ----
+            sk_qty, sk_price = _pick_qty_price('sheep', True)
+            gk_qty, gk_price = _pick_qty_price('goat', True)
+            sn_qty, sn_price = _pick_qty_price('sheep', False)
+            gn_qty, gn_price = _pick_qty_price('goat', False)
 
-            # Sheep Non-KPMD
-            if all(c in self.df.columns for c in [
-                    'E3b. How many sheep did you sell to non-KPMD off-takers  last month?',
-                    'E3c. How many times did you sell  sheep to non-KPMD off-takers  last month?',
-                    'E3d. What was the average price per sheep last month?']):
-                self.df['sheep_non_kpmd_revenue'] = (
-                    to_num(self.df['E3b. How many sheep did you sell to non-KPMD off-takers  last month?']).fillna(0) *
-                    to_num(self.df['E3c. How many times did you sell  sheep to non-KPMD off-takers  last month?']).fillna(0) *
-                    to_num(self.df['E3d. What was the average price per sheep last month?']).fillna(0)
-                )
-                revenue_components.append('sheep_non_kpmd_revenue')
+            # Convert & compute
+            if sk_qty and sk_price:
+                self.df['sheep_kpmd_revenue'] = to_num(self.df[sk_qty]).fillna(0) * to_num(self.df[sk_price]).fillna(0)
+            else:
+                self.df['sheep_kpmd_revenue'] = 0.0
+            if gk_qty and gk_price:
+                self.df['goat_kpmd_revenue'] = to_num(self.df[gk_qty]).fillna(0) * to_num(self.df[gk_price]).fillna(0)
+            else:
+                self.df['goat_kpmd_revenue'] = 0.0
+            if sn_qty and sn_price:
+                self.df['sheep_non_kpmd_revenue'] = to_num(self.df[sn_qty]).fillna(0) * to_num(self.df[sn_price]).fillna(0)
+            else:
+                self.df['sheep_non_kpmd_revenue'] = 0.0
+            if gn_qty and gn_price:
+                self.df['goat_non_kpmd_revenue'] = to_num(self.df[gn_qty]).fillna(0) * to_num(self.df[gn_price]).fillna(0)
+            else:
+                self.df['goat_non_kpmd_revenue'] = 0.0
 
-            # Goats Non-KPMD
-            if all(c in self.df.columns for c in [
-                    'E4b. How many goats did you sell to non-KPMD off-takers  last month?',
-                    'E4c. How many times did you sell goats to non-KPMD off-takers  last month?',
-                    'E4d. What was the average price per goat last month?']):
-                self.df['goat_non_kpmd_revenue'] = (
-                    to_num(self.df['E4b. How many goats did you sell to non-KPMD off-takers  last month?']).fillna(0) *
-                    to_num(self.df['E4c. How many times did you sell goats to non-KPMD off-takers  last month?']).fillna(0) *
-                    to_num(self.df['E4d. What was the average price per goat last month?']).fillna(0)
-                )
-                revenue_components.append('goat_non_kpmd_revenue')
+            # Record what we used (for a quick UI debug table)
+            self._income_debug['channels'] = [
+                {'Channel':'Sheep KPMD',     'Qty':sk_qty, 'Price':sk_price},
+                {'Channel':'Goat KPMD',      'Qty':gk_qty, 'Price':gk_price},
+                {'Channel':'Sheep Non-KPMD', 'Qty':sn_qty, 'Price':sn_price},
+                {'Channel':'Goat Non-KPMD',  'Qty':gn_qty, 'Price':gn_price},
+            ]
 
-            # Feed (fodder) sales
+            # ------ Feed income (unchanged) ------
             if all(c in self.df.columns for c in ['B6d. At What price did you sell a 15 kg bale last month?','B6e. Number of 15 kg bales sold in the last 1 month?']):
                 self.df['fodder_revenue'] = (
                     to_num(self.df['B6d. At What price did you sell a 15 kg bale last month?']).fillna(0) *
                     to_num(self.df['B6e. Number of 15 kg bales sold in the last 1 month?']).fillna(0)
                 )
-                revenue_components.append('fodder_revenue')
+            elif 'fodder_revenue' not in self.df.columns:
+                self.df['fodder_revenue'] = 0.0
 
-            if revenue_components:
-                self.df['total_revenue'] = self.df[revenue_components].sum(axis=1)
+            # Totals and segmented incomes
+            revenue_components = [
+                'sheep_kpmd_revenue','goat_kpmd_revenue',
+                'sheep_non_kpmd_revenue','goat_non_kpmd_revenue','fodder_revenue'
+            ]
+            self.df['total_revenue']   = self.df[revenue_components].sum(axis=1)
+            self.df['income_kpmd']     = self.df['sheep_kpmd_revenue'] + self.df['goat_kpmd_revenue']
+            self.df['income_non_kpmd'] = self.df['sheep_non_kpmd_revenue'] + self.df['goat_non_kpmd_revenue']
+            self.df['income_feed']     = self.df['fodder_revenue']
 
-            # ---- Segmented incomes (force Series defaults) ----
-            sheep_k = self.df['sheep_kpmd_revenue']     if 'sheep_kpmd_revenue'     in self.df.columns else z
-            goat_k  = self.df['goat_kpmd_revenue']      if 'goat_kpmd_revenue'      in self.df.columns else z
-            sheep_n = self.df['sheep_non_kpmd_revenue'] if 'sheep_non_kpmd_revenue' in self.df.columns else z
-            goat_n  = self.df['goat_non_kpmd_revenue']  if 'goat_non_kpmd_revenue'  in self.df.columns else z
-            fodder  = self.df['fodder_revenue']         if 'fodder_revenue'         in self.df.columns else z
-
-            self.df['income_kpmd']     = sheep_k + goat_k
-            self.df['income_non_kpmd'] = sheep_n + goat_n
-            self.df['income_feed']     = fodder
-
-            # -------- Costs --------
+            # -------- Costs (same structure as before) --------
             cost_components = []
             if 'Feed_Expenditure' in self.df.columns:
                 self.df['feed_costs'] = to_num(self.df['Feed_Expenditure']).fillna(0); cost_components.append('feed_costs')
@@ -844,40 +866,25 @@ class APMTDataProcessor:
                 self.df['other_costs'] = self.df[existing_other].sum(axis=1)
                 cost_components.append('other_costs')
 
-            if cost_components:
-                self.df['total_costs'] = self.df[cost_components].sum(axis=1)
-
-            self.df['net_profit'] = self.df['total_revenue'] - self.df['total_costs']
+            self.df['total_costs'] = self.df[cost_components].sum(axis=1) if cost_components else 0.0
+            self.df['net_profit']  = self.df['total_revenue'] - self.df['total_costs']
             valid_revenue = self.df['total_revenue'] > 0
             self.df.loc[valid_revenue, 'profit_margin'] = (
                 self.df.loc[valid_revenue, 'net_profit'] / self.df.loc[valid_revenue, 'total_revenue'] * 100
             )
 
-            # Channel-level examples (sheep)
-            if all(c in self.df.columns for c in ['sheep_kpmd_revenue','transport_costs']):
-                self.df['sheep_kpmd_profit_margin'] = (
-                    (self.df['sheep_kpmd_revenue'] - self.df['transport_costs'] * 0.5) /
-                    self.df['sheep_kpmd_revenue'].replace(0, np.nan) * 100
-                ).replace([np.inf,-np.inf],0).fillna(0)
-            if all(c in self.df.columns for c in ['sheep_non_kpmd_revenue','transport_costs']):
-                self.df['sheep_non_kpmd_profit_margin'] = (
-                    (self.df['sheep_non_kpmd_revenue'] - self.df['transport_costs'] * 0.5) /
-                    self.df['sheep_non_kpmd_revenue'].replace(0, np.nan) * 100
-                ).replace([np.inf,-np.inf],0).fillna(0)
-        except Exception as e:
-            st.warning(f"Some P&L metrics could not be calculated: {str(e)}")
-        finally:
-            # ---- SAFETY NET: guarantee presence of key columns to avoid KeyErrors downstream ----
-            must_have_float = [
+            # Safety net: ensure presence of key columns
+            must_have = [
                 'sheep_kpmd_revenue','goat_kpmd_revenue',
                 'sheep_non_kpmd_revenue','goat_non_kpmd_revenue',
                 'fodder_revenue','total_revenue','total_costs',
-                'net_profit','profit_margin',
-                'income_kpmd','income_non_kpmd','income_feed'
+                'net_profit','profit_margin','income_kpmd','income_non_kpmd','income_feed'
             ]
-            for c in must_have_float:
+            for c in must_have:
                 if c not in self.df.columns:
                     self.df[c] = 0.0
+        except Exception as e:
+            st.warning(f"P&L metric calculation issue: {e}")
 
 # -------------------------------------------------
 # Dashboard Renderer
