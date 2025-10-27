@@ -1411,25 +1411,33 @@ class DashboardRenderer:
                         )
                         gdf_labels["label"] = gdf_labels.apply(lambda r: f"{r['name']}\n{r['farmers']}", axis=1)
 
-                        # 6) Focus controls (better UX than a raw opacity slider)
-                        st.markdown("**Focus**")
-                        # vmax defined above from gdf_counties['farmers']; guaranteed float here
+                        # 6) Focus & layer controls (collapsed by default)
                         max_count = int(vmax) if np.isfinite(vmax) else 0
-                        focus_mode = st.radio(
-                            "Highlight areas with data",
-                            ["Normal", "Dim areas below threshold", "Hide areas below threshold"],
-                            index=1,
-                            horizontal=True,
-                        )
-                        threshold = 0
-                        if max_count > 0 and focus_mode != "Normal":
-                            threshold = st.slider(
-                                "Minimum # of farmers to focus",
-                                0, max_count, max(1, int(round(max_count * 0.05)))
+                        with st.expander("Map focus & layers", expanded=False):
+                            st.caption("Highlight areas with data")
+                            focus_mode = st.radio(
+                                "Highlight areas with data",
+                                ["Normal", "Dim areas below threshold", "Hide areas below threshold"],
+                                index=1,
+                                horizontal=True,
+                                label_visibility="collapsed",
+                                key="map_focus_mode",
                             )
 
-                        show_points = st.checkbox("Show household points", value=True)
-                        show_labels = st.checkbox("Show county labels", value=True)
+                            if max_count > 0 and focus_mode != "Normal":
+                                threshold = st.slider(
+                                    "Minimum # of farmers to focus",
+                                    0, max_count, max(1, int(round(max_count * 0.05))),
+                                    key="map_focus_threshold",
+                                )
+                            else:
+                                threshold = 0
+
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                show_points = st.checkbox("Show household points", value=True, key="map_show_points")
+                            with c2:
+                                show_labels = st.checkbox("Show county labels", value=True, key="map_show_labels")
 
                         # 7) Prepare polygons according to focus mode
                         gdf_c = gdf_counties.copy()
