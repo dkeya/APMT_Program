@@ -246,6 +246,33 @@ def load_apmt_csv(path: str) -> pd.DataFrame:
     except Exception: return pd.read_csv(path, encoding='latin-1', errors='replace')
 
 # -------------------------------------------------
+# Geo assets: ensure county/sub-county files exist (auto-download if missing)
+# -------------------------------------------------
+def ensure_geo_assets():
+    import os, requests
+    os.makedirs("geo", exist_ok=True)
+    assets = {
+        "geo/kenya_counties.geojson":    "https://github.com/wmgeolab/geoBoundaries/raw/main/releaseData/gbOpen/KEN/ADM1/geoBoundaries-KEN-ADM1.geojson",
+        "geo/kenya_subcounties.geojson": "https://github.com/wmgeolab/geoBoundaries/raw/main/releaseData/gbOpen/KEN/ADM2/geoBoundaries-KEN-ADM2.geojson",
+    }
+
+    missing = [p for p in assets if not (os.path.exists(p) and os.path.getsize(p) > 0)]
+    if not missing:
+        return True  # already present
+
+    for path in missing:
+        url = assets[path]
+        try:
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                f.write(r.content)
+        except Exception as e:
+            st.warning(f"Could not fetch {os.path.basename(path)}: {e}")
+            return False
+    return True
+
+# -------------------------------------------------
 # Data Cleaning, Validation & Quality (Merged, folded)
 # -------------------------------------------------
 def clean_and_validate(df: pd.DataFrame):
@@ -2274,7 +2301,14 @@ def main():
         df = load_apmt_csv(DATA_PATH)
         st.success(f"Data loaded successfully: {len(df):,} records")
 
+        # Ensure the GeoJSON base maps are present (downloads once if missing)
+        with st.spinner("Preparing base maps…"):
+            ok_geo = ensure_geo_assets()
+        if not ok_geo:
+            st.warning("Base maps unavailable — county/sub-county outlines will be hidden.")
+
         with st.expander("Data Preview", expanded=False):
+
             st.write(f"Columns detected ({len(df.columns)}):")
             st.write(list(df.columns))
             st.write(f"Total records: {len(df)}")
@@ -2415,7 +2449,6 @@ def main():
             else:
                 st.info("No time information available for date filtering.")
 
-        # ---------- Sidebar: NAVIGATION ----------
         # ---------- Sidebar: NAVIGATION ----------
         st.sidebar.markdown(
             '<div style="color:#dc3545; font-weight:700; font-size:1rem; margin-bottom:0.25rem;">'
