@@ -571,11 +571,11 @@ class APMTDataProcessor:
                 r'^E2c\..*price.*goat',    # Goat  KPMD price
                 r'^E3d\..*price.*sheep',   # Sheep Non-KPMD price
                 r'^E4d\..*price.*goat',    # Goat  Non-KPMD price
+                r'B5c\..*price.*bale',     # Fodder: price per 15 kg bale  ← keep NaN (no zero fill)
             ]
 
-            # Other numeric fields can still be coerced and zero-filled.
             other_numeric_patterns = [
-                r'B3b.*cost.*herding', r'B4b\..*cost', r'B5c\..*price.*bale', r'B5d\..*Number.*bales.*purchased',
+                r'B3b.*cost.*herding', r'B4b\..*cost', r'B5d\..*Number.*bales.*purchased',
                 r'B6b\..*Quantity.*harvested', r'B6d\..*price.*sell', r'B6e\..*Number.*bales.*sold',
                 r'D1a\..*vaccinated', r'D1b\..*cost.*vaccination', r'D3a\..*sick.*treated', r'D3b\..*cost.*treatment',
                 r'D4a\..*cost.*deworming',
@@ -1774,16 +1774,34 @@ class DashboardRenderer:
 
         with tab3:
             st.subheader("Feed Economics")
-            price = 'B5c. What was the price per 15 kg bale in the last 1 month?'
-            if price in self.df.columns:
-                self.create_comparison_cards(self.df, price, 'Price per Bale', 'KES {:.0f}')
+
+            price_col = 'B5c. What was the price per 15 kg bale in the last 1 month?'
+            purchased_col = 'B5a. Did you purchase fodder in the last 1 month?'
+
+            # --- Price per bale: restrict to HHs that actually purchased and reported a price > 0
+            if price_col in self.df.columns:
+                df_price = self.df.copy()
+                # build mask: purchased==Yes (if we have it) AND valid price
+                mask_price = pd.Series(True, index=df_price.index)
+                if purchased_col in df_price.columns:
+                    mask_price &= df_price[purchased_col].apply(yn).astype(int).eq(1)
+                mask_price &= pd.to_numeric(df_price[price_col], errors='coerce').gt(0)
+
+                df_price = df_price.loc[mask_price].copy()
+                if len(df_price) > 0:
+                    self.create_comparison_cards(df_price, price_col, 'Price per Bale', 'KES {:.0f}')
+                else:
+                    st.info("No valid bale prices among households that purchased fodder.")
             else:
                 st.info("Fodder price data not available")
 
+            # --- Feed expenditure: keep as positive-only (already computed as price*qty)
             if 'Feed_Expenditure' in self.df.columns:
-                exp = self.df[self.df['Feed_Expenditure'] > 0]
-                if len(exp) > 0: self.create_comparison_cards(exp, 'Feed_Expenditure', 'Feed Expenditure', 'KES {:.0f}')
-                else: st.info("No households reported feed expenditure")
+                exp = self.df[self.df['Feed_Expenditure'] > 0].copy()
+                if len(exp) > 0:
+                    self.create_comparison_cards(exp, 'Feed_Expenditure', 'Feed Expenditure', 'KES {:.0f}')
+                else:
+                    st.info("No households reported feed expenditure")
             else:
                 st.info("Feed expenditure data not available")
 
