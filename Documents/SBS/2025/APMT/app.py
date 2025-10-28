@@ -1948,7 +1948,9 @@ class DashboardRenderer:
             if age_data:
                 dfp = pd.DataFrame(age_data)
                 fig = px.box(dfp, x='Channel', y='Age', color='KPMD_Status',
-                             title=f'{title_species} Age at Sale by Channel and KPMD Registration')
+                            labels={'Age': 'Age (Months)'},
+                            title=f'{title_species} Age at Sale by Channel and KPMD Registration')
+
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info(f"Age at sale data for {title_species} not available")
