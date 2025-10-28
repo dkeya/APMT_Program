@@ -1604,24 +1604,31 @@ class DashboardRenderer:
 
         with tab2:
             st.subheader("Animal Health Indicators")
+
+            # --- Vaccination Rate ---
             vacc_col = self.dp.column_mapping.get('vaccination')
             if vacc_col and vacc_col in self.df.columns:
+                st.write("**Vaccination Rate**")
                 vacc_data = self.df.copy()
                 vacc_data['vaccinated'] = vacc_data[vacc_col].apply(yn).astype(int)
                 self.create_comparison_cards(vacc_data, 'vaccinated', 'Vaccination Rate', '{:.1%}')
             else:
                 st.info("Vaccination data not available")
 
+            # --- Treatment Rate ---
             treat_col = 'D3. Did you treat small ruminants for disease in the last month?'
             if treat_col in self.df.columns:
+                st.write("**Treatment Rate**")
                 treat_data = self.df.copy()
                 treat_data['treated'] = treat_data[treat_col].apply(yn).astype(int)
                 self.create_comparison_cards(treat_data, 'treated', 'Treatment Rate', '{:.1%}')
             else:
                 st.info("Disease treatment data not available")
 
+            # --- Deworming Rate ---
             deworm_col = 'D4. Did you deworm your small ruminants last month?'
             if deworm_col in self.df.columns:
+                st.write("**Deworming Rate**")
                 deworm_data = self.df.copy()
                 deworm_data['dewormed'] = deworm_data[deworm_col].apply(yn).astype(int)
                 self.create_comparison_cards(deworm_data, 'dewormed', 'Deworming Rate', '{:.1%}')
@@ -1684,11 +1691,19 @@ class DashboardRenderer:
 
         with tab3:
             st.subheader("Small Ruminant Productivity Indicators")
+            # --- Birth Rate ---
             if 'birth_rate_per_100' in self.df.columns:
+                st.write("**Birth Rate (per 100 head)**")
                 self.create_comparison_cards(self.df, 'birth_rate_per_100', 'Birth Rate', '{:.1f}')
+
+            # --- Mortality Rate ---
             if 'mortality_rate_per_100' in self.df.columns:
+                st.write("**Mortality Rate (per 100 head)**")
                 self.create_comparison_cards(self.df, 'mortality_rate_per_100', 'Mortality Rate', '{:.1f}')
+
+            # --- Loss Rate ---
             if 'loss_rate_per_100' in self.df.columns:
+                st.write("**Loss Rate (per 100 head)**")
                 self.create_comparison_cards(self.df, 'loss_rate_per_100', 'Loss Rate', '{:.1f}')
 
             if all(c in self.df.columns for c in ['birth_rate_per_100','mortality_rate_per_100','loss_rate_per_100','kpmd_registered']):
