@@ -565,15 +565,31 @@ class APMTDataProcessor:
                 for col in self._find_columns_pattern(pat):
                     self.df[col] = self.df[col].apply(yn).astype(int)
 
-            numeric_patterns = [
+            # Keep price fields numeric but DO NOT zero-fill them.
+            price_patterns = [
+                r'^E1c\..*price.*sheep',   # Sheep KPMD price
+                r'^E2c\..*price.*goat',    # Goat  KPMD price
+                r'^E3d\..*price.*sheep',   # Sheep Non-KPMD price
+                r'^E4d\..*price.*goat',    # Goat  Non-KPMD price
+            ]
+
+            # Other numeric fields can still be coerced and zero-filled.
+            other_numeric_patterns = [
                 r'B3b.*cost.*herding', r'B4b\..*cost', r'B5c\..*price.*bale', r'B5d\..*Number.*bales.*purchased',
                 r'B6b\..*Quantity.*harvested', r'B6d\..*price.*sell', r'B6e\..*Number.*bales.*sold',
                 r'D1a\..*vaccinated', r'D1b\..*cost.*vaccination', r'D3a\..*sick.*treated', r'D3b\..*cost.*treatment',
                 r'D4a\..*cost.*deworming',
-                r'^E[1-4][chi]\..*price|^E[1-4][bh]\..*(How many|times)|^E[1-4]f\..*weight|^E[1-4]g\..*weight|^E[1-4]h\..*transport',
+                r'^E[1-4][bh]\..*(How many|times)',  # quantities
+                r'^E[1-4]f\..*weight|^E[1-4]g\..*weight|^E[1-4]h\..*transport',
                 r'^F1\.'
             ]
-            for pat in numeric_patterns:
+
+            # Apply conversions
+            for pat in price_patterns:
+                for col in self._find_columns_pattern(pat):
+                    self.df[col] = to_num(self.df[col])  # keep NaN if not provided
+
+            for pat in other_numeric_patterns:
                 for col in self._find_columns_pattern(pat):
                     self.df[col] = to_num(self.df[col]).fillna(0)
 
@@ -925,8 +941,8 @@ class DashboardRenderer:
         return self.dp.df
 
     def _controls_for_lsmeans(self, group_col=None):
-        candidates = ['County','Gender','total_sr','month']
-        return [c for c in self.df.columns if c in self.df.columns and c != group_col]
+        candidates = ['County', 'Gender', 'total_sr', 'month']
+        return [c for c in candidates if c in self.df.columns and c != group_col]
 
     def _with_kpmd_status(self, data: pd.DataFrame) -> pd.DataFrame:
         """Return a copy with a categorical 'KPMD Status' column for clean legends/axes."""
@@ -1814,28 +1830,72 @@ class DashboardRenderer:
 
         with tab2:
             st.subheader("Price Analysis")
-            price_data = []
+
+            # Build seller flags for masks
+            sold_kpmd = None
+            sold_non  = None
+            if kpmd_sold_col and kpmd_sold_col in self.df.columns:
+                sold_kpmd = self.df[kpmd_sold_col].apply(yn).astype(int) == 1
+            if non_kpmd_sold_col and non_kpmd_sold_col in self.df.columns:
+                sold_non = self.df[non_kpmd_sold_col].apply(yn).astype(int) == 1
+
+            # Subset for KPMD prices: must have non-missing price AND (if available) sold_kpmd == True
+            df_kpmd = pd.DataFrame(columns=self.df.columns)
             if price_kpmd_col in self.df.columns:
-                for s in [0,1]:
-                    sub = self.df[self.df['kpmd_registered']==s]
-                    vals = to_num(sub[price_kpmd_col]).dropna()
-                    price_data += [{'Channel':'KPMD','Price':v,'KPMD_Status':'KPMD Registered' if s==1 else 'Non-KPMD Registered'} for v in vals]
+                mask = self.df[price_kpmd_col].notna()
+                if sold_kpmd is not None:
+                    mask &= sold_kpmd
+                df_kpmd = self.df.loc[mask].copy()
+
+            # Subset for Non-KPMD prices: must have non-missing price AND (if available) sold_non == True
+            df_non = pd.DataFrame(columns=self.df.columns)
             if price_non_col in self.df.columns:
-                for s in [0,1]:
-                    sub = self.df[self.df['kpmd_registered']==s]
+                mask = self.df[price_non_col].notna()
+                if sold_non is not None:
+                    mask &= sold_non
+                df_non = self.df.loc[mask].copy()
+
+            # Build boxplot dataframe from the filtered subsets
+            price_data = []
+            if not df_kpmd.empty:
+                for s in [0, 1]:
+                    sub = df_kpmd[df_kpmd['kpmd_registered'] == s]
+                    vals = to_num(sub[price_kpmd_col]).dropna()
+                    price_data += [
+                        {'Channel': 'KPMD', 'Price': v, 'KPMD_Status': 'KPMD Registered' if s == 1 else 'Non-KPMD Registered'}
+                        for v in vals
+                    ]
+            if not df_non.empty:
+                for s in [0, 1]:
+                    sub = df_non[df_non['kpmd_registered'] == s]
                     vals = to_num(sub[price_non_col]).dropna()
-                    price_data += [{'Channel':'Non-KPMD','Price':v,'KPMD_Status':'KPMD Registered' if s==1 else 'Non-KPMD Registered'} for v in vals]
+                    price_data += [
+                        {'Channel': 'Non-KPMD', 'Price': v, 'KPMD_Status': 'KPMD Registered' if s == 1 else 'Non-KPMD Registered'}
+                        for v in vals
+                    ]
+
             if price_data:
                 dfp = pd.DataFrame(price_data)
                 fig = px.box(dfp, x='Channel', y='Price', color='KPMD_Status',
-                             title=f'{title_species} Price Distribution by Channel and KPMD Registration')
+                            title=f'{title_species} Price Distribution by Channel and KPMD Registration')
                 st.plotly_chart(fig, use_container_width=True)
+
+                # LSMeans computed ONLY on the filtered subsets
                 controls = self._controls_for_lsmeans(group_col='kpmd_registered')
-                for ch, col in [('KPMD', price_kpmd_col), ('Non-KPMD', price_non_col)]:
-                    if col in self.df.columns:
-                        lsm = lsmeans_by_group(self.df.dropna(subset=[col]), col, 'kpmd_registered', controls)
-                        if isinstance(lsm, dict):
-                            st.caption(f"{ch} price LSMean — KPMD: {lsm.get(1, np.nan):,.0f} | Non-KPMD: {lsm.get(0, np.nan):,.0f}")
+
+                if not df_kpmd.empty and price_kpmd_col in df_kpmd.columns:
+                    lsm_k = lsmeans_by_group(df_kpmd.dropna(subset=[price_kpmd_col]), price_kpmd_col, 'kpmd_registered', controls)
+                    if isinstance(lsm_k, dict):
+                        st.caption(
+                            f"KPMD price LSMean — KPMD: {lsm_k.get(1, np.nan):,.0f} | Non-KPMD: {lsm_k.get(0, np.nan):,.0f}"
+                        )
+
+                if not df_non.empty and price_non_col in df_non.columns:
+                    lsm_n = lsmeans_by_group(df_non.dropna(subset=[price_non_col]), price_non_col, 'kpmd_registered', controls)
+                    if isinstance(lsm_n, dict):
+                        st.caption(
+                            f"Non-KPMD price LSMean — KPMD: {lsm_n.get(1, np.nan):,.0f} | Non-KPMD: {lsm_n.get(0, np.nan):,.0f}"
+                        )
             else:
                 st.info(f"Price data for {title_species} not available")
 
