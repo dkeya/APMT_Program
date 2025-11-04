@@ -2279,7 +2279,7 @@ class DashboardRenderer:
     def render_payments(self):
         st.header("💸 Payment Methods")
 
-        def _norm(s: str) -> str:
+        def _norm(s: str) -> str: 
             return re.sub(r'\s+', ' ', str(s)).strip().lower()
 
         stems = [
@@ -2289,18 +2289,18 @@ class DashboardRenderer:
             ('Goats – Other', 'E4h. How were you paid by the non-KPMD off-takers  last  month? [Select all that apply]'),
         ]
 
-        rows = []
-        cols_norm = defaultdict(list)
+        rows = []; cols_norm = defaultdict(list)
         for c in self.df.columns:
             cols_norm[_norm(c)].append(c)
 
         for label, stem in stems:
             stem_n = _norm(stem)
+            subcols = []
+            for c in self.df.columns:
+                c_n = _norm(c)
+                if c_n.startswith(stem_n) and '/' in c:
+                    subcols.append(c)
 
-            # Find one-hot subcolumns under this stem (E*g/<option>)
-            subcols = [c for c in self.df.columns if _norm(c).startswith(stem_n) and '/' in c]
-
-            # Classify options into mobile vs cash
             mobile_cols, cash_cols = [], []
             for c in subcols:
                 suffix = _norm(c.split('/', 1)[1])
@@ -2309,25 +2309,16 @@ class DashboardRenderer:
                 if 'cash' in suffix:
                     cash_cols.append(c)
 
-            # Or find a single multiselect column
             cands = cols_norm.get(stem_n, [])
             single_col = max(cands, key=len) if cands else None
 
-            # Build 0/1 series for mobile & cash
-            def _01_from_cols(df, cols):
-                if not cols:
-                    return None
-                block = (df[cols].astype(str)
-                            .replace({'1': 1, '0': 0, 'true': 1, 'false': 0, 'True': 1, 'False': 0})
-                            .apply(pd.to_numeric, errors='coerce')
-                            .fillna(0))
-                # any selected in that set
-                return (block.max(axis=1)).clip(0, 1)
-
-            mobile_series = _01_from_cols(self.df, mobile_cols)
-            cash_series   = _01_from_cols(self.df, cash_cols)
-
-            # If needed, derive from a single multiselect text col
+            mobile_series = None; cash_series = None
+            if mobile_cols:
+                mobile_series = (self.df[mobile_cols].astype(str).replace({'1':1,'0':0})
+                                .apply(pd.to_numeric, errors='coerce').fillna(0).max(axis=1))
+            if cash_cols:
+                cash_series = (self.df[cash_cols].astype(str).replace({'1':1,'0':0})
+                            .apply(pd.to_numeric, errors='coerce').fillna(0).max(axis=1))
             if (mobile_series is None or cash_series is None) and (single_col is not None):
                 dummies = one_hot_multiselect(self.df[single_col])
                 if mobile_series is None:
@@ -2337,136 +2328,111 @@ class DashboardRenderer:
                     tok = next((t for t in dummies.columns if _norm(t).startswith('cash')), None)
                     cash_series = dummies.get(tok, pd.Series(0, index=self.df.index))
 
-            # Fall back to zeros if still missing
-            if mobile_series is None:
-                mobile_series = pd.Series(0, index=self.df.index)
-            if cash_series is None:
-                cash_series = pd.Series(0, index=self.df.index)
+            if mobile_series is None: mobile_series = pd.Series(0, index=self.df.index)
+            if cash_series   is None: cash_series   = pd.Series(0, index=self.df.index)
 
-            # -------- Correct denominator: only payers in this block --------
-            any_method = ((pd.to_numeric(mobile_series, errors='coerce').fillna(0) > 0) |
-                        (pd.to_numeric(cash_series,   errors='coerce').fillna(0) > 0))
+            tmp_cols = ['kpmd_registered'] + (['County'] if 'County' in self.df.columns else [])
+            tmp = self.df[tmp_cols].copy()
 
-            base = self.df.loc[any_method].copy()
-            if base.empty:
-                # Nothing selected for this block — skip gracefully
-                continue
+            # ✅ Household id carried through each block (REQUIRED for household-level metrics)
+            tmp['hhid'] = self.df.index
 
-            base['block']  = label
-            base['mobile'] = pd.to_numeric(mobile_series.loc[base.index], errors='coerce').fillna(0).clip(0, 1).astype(int)
-            base['cash']   = pd.to_numeric(cash_series.loc[base.index],   errors='coerce').fillna(0).clip(0, 1).astype(int)
-            base['both']   = ((base['mobile'] == 1) & (base['cash'] == 1)).astype(int)
-
-            # Keep County/KPMD if present
-            keep_cols = ['block', 'mobile', 'cash', 'both']
-            if 'kpmd_registered' in base.columns:
-                keep_cols.append('kpmd_registered')
-            if 'County' in base.columns:
-                keep_cols.append('County')
-
-            rows.append(base[keep_cols])
+            tmp['block']  = label
+            tmp['mobile'] = pd.to_numeric(mobile_series, errors='coerce').fillna(0).clip(0,1).astype(int)
+            tmp['cash']   = pd.to_numeric(cash_series,   errors='coerce').fillna(0).clip(0,1).astype(int)
+            tmp['both']   = ((tmp['mobile']==1) & (tmp['cash']==1)).astype(int)
+            rows.append(tmp)
 
         if not rows:
-            st.info("No payment method selections found in the current filter.")
+            st.info("No payment method columns found")
             return
 
         payment = pd.concat(rows, ignore_index=True)
 
-        # Shares are w.r.t. the correct denominator (payers in each block × KPMD)
-        grp = payment.groupby(['block', 'kpmd_registered'], dropna=False)
-        denom = grp.size().rename('n').reset_index()
+        # --------- Channel/species × KPMD shares ---------
+        grp = payment.groupby(['block','kpmd_registered'], dropna=False)
         summary = pd.DataFrame({
             'Mobile share': grp['mobile'].mean() * 100,
             'Cash share':   grp['cash'].mean() * 100,
             'Both share':   grp['both'].mean() * 100
-        }).reset_index().merge(denom, on=['block', 'kpmd_registered'], how='left')
-
-        summary['KPMD Status'] = summary['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
-        long = summary.melt(
-            id_vars=['block', 'KPMD Status', 'n'],
-            value_vars=['Cash share', 'Mobile share', 'Both share'],
-            var_name='Method',
-            value_name='Share'
-        )
-
-        if long.dropna(subset=['Share']).empty:
+        }).reset_index()
+        summary['KPMD Status'] = summary['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
+        long = summary.melt(id_vars=['block','KPMD Status'],
+                            value_vars=['Cash share','Mobile share','Both share'],
+                            var_name='Method', value_name='Share')
+        if long['Share'].sum() == 0 or long.dropna(subset=['Share']).empty:
             st.warning("No non-zero payment shares detected. Check column names in your CSV.")
             return
 
-        fig = px.bar(
-            long, x='block', y='Share', color='Method', barmode='group',
-            facet_col='KPMD Status',
-            title='Payment method mix by channel/species and KPMD'
-        )
+        fig = px.bar(long, x='block', y='Share', color='Method', barmode='group', facet_col='KPMD Status',
+                    title='Payment method mix by channel/species and KPMD')
         fig.update_traces(text=long['Share'].round(1), textposition='outside')
         fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
         st.plotly_chart(fig, use_container_width=True)
 
-        # Show denominators beneath the figure
-        cap = (long.groupby(['KPMD Status', 'block'])['n'].max()
-                    .reset_index()
-                    .sort_values(['KPMD Status', 'block']))
-        parts = [f"{r['KPMD Status']} – {r['block']}: n={int(r['n']):,}" for _, r in cap.iterrows()]
-        st.caption("Denominator = households that reported a payment method in that block. " + " | ".join(parts))
-
         # ------------ Digital adoption (household-level, payers only) ------------
         st.subheader("Digital adoption by county (Mobile or Both)")
 
-        # Collapse to one record per household: if they used mobile/cash anywhere, count it
-        hh = (payment
-            .groupby(['hhid','County','kpmd_registered'])[['mobile','cash','both']]
-            .max()  # any channel/species
+        # safety: make sure County exists
+        if 'County' not in payment.columns:
+            payment['County'] = '(Unspecified)'
+
+        # NOTE: we already put household ids in each block above: tmp['hhid'] = self.df.index
+        # so DON'T overwrite it here (lengths differ because payment has multiple blocks)
+        if 'hhid' not in payment.columns:
+            payment['hhid'] = self.df.index  # last resort
+
+        # Collapse to one row per household × County × KPMD across all sales blocks
+        agg = (payment
+            .groupby(['hhid', 'County', 'kpmd_registered'], dropna=False)[['mobile', 'cash', 'both']]
+            .max()
             .reset_index())
 
-        hh['payer']   = ((hh['mobile'] == 1) | (hh['cash'] == 1)).astype(int)
-        hh['digital'] = (hh['mobile'] == 1).astype(int)  # mobile (incl. “both”) is digital
+        # Payer = used mobile OR cash at least once; Digital = used mobile OR both at least once
+        agg['payer']   = ((agg['mobile'] == 1) | (agg['cash'] == 1)).astype(int)
+        agg['digital'] = ((agg['mobile'] == 1) | (agg['both'] == 1)).astype(int)
 
-        if 'County' in hh.columns:
-            c1, c2 = st.columns([1,1])
-            with c1:
-                min_n = st.number_input("Minimum payers per County × KPMD to include",
-                                        min_value=1, max_value=200, value=5, step=1)
-            with c2:
-                show_0_100 = st.checkbox("Fix y-axis to 0–100%", value=False)
+        # --- Controls ---
+        min_payers = st.number_input("Minimum payers per County × KPMD to include", min_value=0, value=5, step=1)
+        include_subthreshold = st.checkbox("Include groups below threshold", value=False)
 
-            payers = hh[hh['payer'] == 1].copy()
-            if payers.empty:
-                st.info("No digital payments found among payers.")
-            else:
-                # % digital among payers + denominators (payers only)
-                grp = payers.groupby(['County','kpmd_registered'])
-                county_summary = grp['digital'].mean().mul(100).rename('digital').reset_index()
-                county_summary['n'] = grp.size().values
-                county_summary = county_summary[county_summary['n'] >= min_n]
-                county_summary['KPMD Status'] = county_summary['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
+        # Summarize at County × KPMD among payers only
+        payers = agg[agg['payer'] == 1].copy()
+        summary = (payers
+            .groupby(['County', 'kpmd_registered'], dropna=False)
+            .agg(n=('hhid', 'nunique'),
+                digital_share=('digital', lambda s: s.mean() * 100.0))
+            .reset_index())
+        summary['KPMD Status'] = summary['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
 
-                if county_summary.empty or county_summary['digital'].sum() == 0:
-                    st.info("No digital payments found among payers (after filters).")
-                else:
-                    order = (county_summary.groupby('County')['digital']
-                            .mean().sort_values(ascending=False).index.tolist())
-                    county_summary['County'] = pd.Categorical(county_summary['County'],
-                                                            categories=order, ordered=True)
-                    ounty_summary = county_summary.sort_values(['County','KPMD Status'])
+        # Filter by threshold
+        below = summary[summary['n'] < min_payers][['County', 'KPMD Status', 'n']]
+        shown = summary if include_subthreshold else summary[summary['n'] >= min_payers]
 
-                    fig2 = px.bar(county_summary, x='County', y='digital', color='KPMD Status',
-                                barmode='group', title='Digital share (%)',
-                                labels={'digital':'Digital share (%)'})
-                    fig2.update_traces(
-                        text=county_summary.apply(lambda r: f"{r['digital']:.1f}% (n={int(r['n'])})", axis=1),
-                        textposition='outside'
-                    )
-                    fig2.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
-                    if show_0_100:
-                        fig2.update_yaxes(range=[0, 100])
-                    st.plotly_chart(fig2, use_container_width=True)
-
-                    cap = (county_summary[['County','KPMD Status','n']]
-                        .sort_values(['County','KPMD Status']))
-                    parts = [f"{r['County']} – {r['KPMD Status']}: n={int(r['n'])}" for _, r in cap.iterrows()]
-                    st.caption("Denominator: payers only (household-level). " + " | ".join(parts))
+        if shown.empty:
+            st.info("No groups meet the minimum payer threshold.")
         else:
-            st.info("County column not available for county split")
+            shown = shown.copy()
+            shown['label'] = shown.apply(lambda r: f"{r['digital_share']:.1f}% (n={int(r['n'])})", axis=1)
+            fix_axis = st.checkbox("Fix y-axis to 0–100%")
+            fig2 = px.bar(
+                shown, x='County', y='digital_share', color='KPMD Status',
+                barmode='group', text='label', title='Digital share (%)',
+                labels={'digital_share': 'Digital share (%)'}
+            )
+            fig2.update_traces(textposition='outside')
+            if fix_axis:
+                fig2.update_yaxes(range=[0, 100])
+            st.plotly_chart(fig2, use_container_width=True)
+
+            # Denominator note + which groups were filtered out
+            denom_note = " | ".join([f"{r['County']} – {r['KPMD Status']}: n={int(r['n'])}"
+                                    for _, r in shown[['County','KPMD Status','n']].iterrows()])
+            st.caption("Denominator: payers only (household-level). " + denom_note)
+            if not include_subthreshold and not below.empty:
+                dropped = " | ".join([f"{r['County']} – {r['KPMD Status']}: n={int(r['n'])}"
+                                    for _, r in below.iterrows()])
+                st.caption("Hidden (below threshold): " + dropped)
 
     # ---------------- County Comparator ----------------
     def render_county_compare(self):
