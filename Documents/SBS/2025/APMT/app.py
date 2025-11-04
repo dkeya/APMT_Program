@@ -989,7 +989,7 @@ class DashboardRenderer:
         except Exception as e:
             st.warning(f"Could not create comparison cards for {metric_col}: {e}")
 
-    # ---------------- NEW: Pastoral Livelihoods (as tabs) ----------------
+    # ---------------- Pastoral Livelihoods ----------------
     def render_pastoral_livelihoods(self):
         st.header("🏠 Pastoral Livelihoods")
         self.dp.calculate_pl_metrics()
@@ -1000,66 +1000,113 @@ class DashboardRenderer:
             "Price Information Access"
         ])
 
+        # --- helpers ---
+        def _num(s):
+            return pd.to_numeric(s, errors="coerce")
+
+        def _has_cols(df, cols):
+            return all(c in df.columns for c in cols)
+
         # --- Tab 1: Income Segmentation ---
         with tab1:
             st.subheader("Household Income Segmentation (Monthly)")
-            # ---- Ensure columns exist before slicing (belt-and-braces) ----
-            for c in ['income_kpmd','income_non_kpmd','income_feed','kpmd_registered']:
-                if c not in self.df.columns:
-                    self.df[c] = 0.0
 
-            try:
-                inc = self.df[['income_kpmd','income_non_kpmd','income_feed','kpmd_registered']].copy()
-                inc.rename(columns={
-                    'income_kpmd':'KPMD Livestock Income',
-                    'income_non_kpmd':'Non-KPMD Livestock Income',
-                    'income_feed':'Feed Income'
-                }, inplace=True)
+            # Use the numeric columns produced by calculate_pl_metrics
+            income_cols_map = {
+                "income_kpmd": "KPMD Livestock Income",
+                "income_non_kpmd": "Non-KPMD Livestock Income",
+                "income_feed": "Feed Income",
+            }
+            base_cols = list(income_cols_map.keys()) + ["kpmd_registered"]
 
-                avg_comp = inc[['KPMD Livestock Income','Non-KPMD Livestock Income','Feed Income']].mean()
-                fig = px.pie(values=avg_comp.values, names=avg_comp.index, title='Average Household Income Mix')
-                st.plotly_chart(fig, use_container_width=True)
+            if not _has_cols(self.df, base_cols):
+                missing = [c for c in base_cols if c not in self.df.columns]
+                st.info(f"Income fields missing: {', '.join(missing)}")
+            else:
+                inc = self.df[base_cols].copy()
+                for c in income_cols_map.keys():
+                    inc[c] = _num(inc[c])
 
-                melted = inc.melt(id_vars=['kpmd_registered'], var_name='Income Type', value_name='KES')
-                grp = melted.groupby(['kpmd_registered','Income Type'])['KES'].mean().reset_index()
-                grp['KPMD Status'] = grp['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
-                fig2 = px.bar(grp, x='Income Type', y='KES', color='KPMD Status', barmode='group',
-                        title='Average Income by KPMD Registration')
-                fig2.update_traces(text=grp['KES'].round(0), textposition='outside')
-                fig2.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
-                st.plotly_chart(fig2, use_container_width=True)
+                # Avoid fabricating zero series: if a column is entirely NaN, call it out
+                all_nan = [k for k, v in income_cols_map.items() if inc[k].notna().sum() == 0]
+                if all_nan:
+                    st.warning("No data for: " + ", ".join(income_cols_map[k] for k in all_nan))
 
+                # Pie: average mix across *available* values only
+                avg_mix = []
+                for k, label in income_cols_map.items():
+                    s = inc[k].dropna()
+                    if len(s):
+                        avg_mix.append((label, s.mean()))
+                if avg_mix:
+                    names, vals = zip(*avg_mix)
+                    fig = px.pie(values=list(vals), names=list(names), title='Average Household Income Mix')
+                    st.plotly_chart(fig, use_container_width=True)
+
+                # Grouped bar: mean by KPMD
+                melted = (
+                    inc.rename(columns=income_cols_map)
+                    .melt(id_vars=['kpmd_registered'], var_name='Income Type', value_name='KES')
+                )
+                melted['KES'] = _num(melted['KES'])
+                grp = (
+                    melted.dropna(subset=['KES'])
+                        .groupby(['kpmd_registered','Income Type'])['KES']
+                        .mean()
+                        .reset_index()
+                )
+                if len(grp):
+                    grp['KPMD Status'] = grp['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+                    fig2 = px.bar(
+                        grp, x='Income Type', y='KES', color='KPMD Status',
+                        barmode='group', title='Average Income by KPMD Registration',
+                        text=grp['KES'].round(0)
+                    )
+                    fig2.update_traces(textposition='outside')
+                    fig2.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
+                    st.plotly_chart(fig2, use_container_width=True)
+
+                # LSMeans: compute per income variable on its native column
                 controls = self._controls_for_lsmeans(group_col='kpmd_registered')
                 ls_notes = []
-                for inc_type, col in [('KPMD Livestock Income','income_kpmd'),
-                                    ('Non-KPMD Livestock Income','income_non_kpmd'),
-                                    ('Feed Income','income_feed')]:
-                    lsm = lsmeans_by_group(inc.dropna(subset=[inc_type]).assign(**{
-                        # map back to original column names for lsmeans
-                        col: inc[inc_type]
-                    }), col, 'kpmd_registered', controls=controls)
-                    if isinstance(lsm, dict):
-                        ls_notes.append(f"{inc_type} — LSMean KPMD: {lsm.get(1, np.nan):,.0f}, Non-KPMD: {lsm.get(0, np.nan):,.0f}")
+                for col, label in income_cols_map.items():
+                    df_lsm = inc[['kpmd_registered', col]].dropna()
+                    if len(df_lsm) >= 2 and df_lsm[col].var() > 0:
+                        # NOTE: positional args; no keyword names
+                        lsm = lsmeans_by_group(df_lsm, col, 'kpmd_registered', controls)
+                        if isinstance(lsm, dict):
+                            ls_notes.append(
+                                f"{label} — LSMean KPMD: {lsm.get(1, np.nan):,.0f}, "
+                                f"Non-KPMD: {lsm.get(0, np.nan):,.0f}"
+                            )
                 if ls_notes:
                     st.caption("Adjusted (LSMeans): " + " | ".join(ls_notes))
-            except KeyError as e:
-                st.warning(f"Error processing income segmentation: missing {list(e.args)}")
 
         # --- Tab 2: Access to Markets ---
         with tab2:
             st.subheader("Access to Markets")
-            f1 = coalesce_first(self.df, ['F1. How far did you travel to sell small ruminants in Kilometers last month?'])
+            f1 = coalesce_first(
+                self.df,
+                ['F1. How far did you travel to sell small ruminants in Kilometers last month?']
+            )
             if f1:
                 try:
-                    self.create_comparison_cards(self.df, f1, "Distance to Market (km)", "{:.1f} km")
-                    fig = px.histogram(self.df, x=f1, nbins=20, title='Distribution of Distance to Market (km)',
-                                       labels={f1:'Distance (km)'})
+                    dfD = self.df.copy()
+                    dfD[f1] = _num(dfD[f1])
+                    self.create_comparison_cards(dfD, f1, "Distance to Market (km)", "{:.1f} km")
+
+                    fig = px.histogram(dfD.dropna(subset=[f1]), x=f1, nbins=20,
+                                    title='Distribution of Distance to Market (km)',
+                                    labels={f1: 'Distance (km)'})
                     st.plotly_chart(fig, use_container_width=True)
-                    if 'kpmd_registered' in self.df.columns:
-                        fig2 = px.box(self.df, x='kpmd_registered', y=f1, color='kpmd_registered',
-                                      labels={'kpmd_registered':'KPMD Registered', f1:'Distance (km)'},
+
+                    if 'kpmd_registered' in dfD.columns:
+                        box = dfD.dropna(subset=[f1])
+                        if len(box):
+                            box['KPMD Status'] = box['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+                            fig2 = px.box(box, x='KPMD Status', y=f1,
                                       title='Distance to Market by KPMD Registration')
-                        st.plotly_chart(fig2, use_container_width=True)
+                            st.plotly_chart(fig2, use_container_width=True)
                 except Exception as e:
                     st.warning(f"Error processing Access to Markets: {e}")
             else:
@@ -1068,16 +1115,69 @@ class DashboardRenderer:
         # --- Tab 3: Price Information Access ---
         with tab3:
             st.subheader("Price Information Access")
-            f2 = coalesce_first(self.df, ['F2. Did you get information about livestock prices prior to selling in the last three months?'])
+
+            # Try multiple plausible column names/variants
+            f2 = coalesce_first(
+                self.df,
+                [
+                    'F2. Did you get information about livestock prices prior to selling in the last three months?',
+                    'F2. Did you get information about livestock prices prior to selling in the last 3 months?',
+                    'F2. Did you get livestock price information before selling in the last three months?',
+                    'F2. Did you get livestock price information before selling in the last 3 months?',
+                    'F2. Did you get price information prior to selling (last 3 months)?',
+                    'F2. Price information access (3 months)',
+                    'price_info', 'price_information', 'Got price information?'
+                ]
+            )
+
             if f2:
                 try:
                     tmp = self.df.copy()
-                    tmp['price_info'] = tmp[f2].apply(yn).astype(int)
-                    self.create_comparison_cards(tmp, 'price_info', 'Households Accessing Price Info', '{:.1%}')
+
+                    # robust yes/no parser
+                    s = tmp[f2].astype(str).str.strip().str.lower()
+                    mapped = s.map({
+                        'yes': 1, 'y': 1, 'true': 1, 't': 1, '1': 1, 'ndio': 1, 'ndiyo': 1,
+                        'no': 0, 'n': 0, 'false': 0, 'f': 0, '0': 0, 'la': 0, 'hapana': 0
+                    })
+
+                    # if mapping failed (all NaN), try numeric > 0 => 1
+                    if mapped.notna().sum() == 0:
+                        as_num = pd.to_numeric(tmp[f2], errors='coerce')
+                        mapped = (as_num > 0).astype('Int64')
+
+                    # Use only respondents who were actually asked (non-null in source)
+                    mask = tmp[f2].notna()
+                    tmp = tmp.loc[mask].copy()
+                    tmp['price_info'] = mapped.loc[mask].fillna(0).astype(int)
+
+                    # Show quick raw distribution to verify parsing
+                    with st.expander("Debug: raw responses for price info (F2)", expanded=False):
+                        vc = self.df[f2].value_counts(dropna=False)
+                        st.write(vc.to_frame('count'))
+
+                    # Comparison cards (denominator = respondents with F2 present)
+                    self.create_comparison_cards(
+                        tmp, 'price_info', 'Households Accessing Price Info', '{:.1%}'
+                    )
+
+                    # Small note on denominator to avoid confusion
+                    st.caption(
+                        f"Denominator uses households with a valid response in **{f2}** "
+                        f"(n={len(tmp):,})."
+                    )
+
+                    # Optional: warn if everything is zero after robust parsing
+                    if tmp['price_info'].sum() == 0 and len(tmp) > 0:
+                        st.info(
+                            "All valid responses are 'No' (or 0) in the current filter. "
+                            "If you expected non-zero, check the raw value distribution above."
+                        )
+
                 except Exception as e:
                     st.warning(f"Error processing Price Information Access: {e}")
             else:
-                st.info("F2 (price information) not available")
+                st.info("F2 (price information) not found in this dataset.")
 
     # ---------------- KPMD Participation ----------------
     def render_kpmd_participation(self):
@@ -1555,6 +1655,8 @@ class DashboardRenderer:
                             )
                         )
 
+    # paste this INSIDE class DashboardRenderer: (same level as your other render_* methods)
+
     # ---------------- Pastoral Productivity ----------------
     def render_pastoral_productivity(self):
         st.header("🐑 Pastoral Productivity")
@@ -1562,18 +1664,25 @@ class DashboardRenderer:
 
         tab1, tab2, tab3 = st.tabs(["Herd Composition", "Animal Health Indicators", "SR Productivity Indicators"])
 
+        # ---------- Tab 1: Herd Composition ----------
         with tab1:
             st.subheader("Herd Structure & Size")
             st.write("**Average Animals Owned**")
+
+            sheep_col = (self.dp.column_mapping.get('total_sheep')
+                         if hasattr(self.dp, 'column_mapping') else None) or 'total_sheep'
+            goats_col = (self.dp.column_mapping.get('total_goats')
+                         if hasattr(self.dp, 'column_mapping') else None) or 'total_goats'
+
             col1, col2 = st.columns(2)
             with col1:
-                if 'total_sheep' in self.df.columns:
-                    self.create_comparison_cards(self.df, 'total_sheep', 'Average Sheep', '{:.1f}')
+                if sheep_col in self.df.columns:
+                    self.create_comparison_cards(self.df, sheep_col, 'Average Sheep', '{:.1f}')
                 else:
                     st.info("Sheep data not available")
             with col2:
-                if 'total_goats' in self.df.columns:
-                    self.create_comparison_cards(self.df, 'total_goats', 'Average Goats', '{:.1f}')
+                if goats_col in self.df.columns:
+                    self.create_comparison_cards(self.df, goats_col, 'Average Goats', '{:.1f}')
                 else:
                     st.info("Goat data not available")
 
@@ -1584,17 +1693,25 @@ class DashboardRenderer:
                 st.write("**Percentage Male Stock**")
                 self.create_comparison_cards(self.df, 'pct_male', 'Male Stock %', '{:.1f}%')
 
-            if all(col in self.df.columns for col in ['total_sheep','total_goats','kpmd_registered']):
+            if all(col in self.df.columns for col in [sheep_col, goats_col, 'kpmd_registered']):
                 st.subheader("Herd Composition by KPMD Status")
                 try:
-                    comp = self.df.groupby('kpmd_registered')[['total_sheep','total_goats']].mean().reset_index()
-                    comp['kpmd_status'] = comp['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
-                    melted = comp.melt(id_vars=['kpmd_status'], value_vars=['total_sheep','total_goats'],
-                                       var_name='Species', value_name='Average Count')
-                    melted['Species'] = melted['Species'].map({'total_sheep':'Sheep','total_goats':'Goats'})
-                    fig = px.bar(melted, x='kpmd_status', y='Average Count', color='Species',
-                                 title='Average Herd Composition by KPMD Status', barmode='group')
-                    fig.update_traces(text=melted['Average Count'].round(1), textposition='outside')
+                    need = ['kpmd_registered', sheep_col, goats_col]
+                    dfh = self.df[need].copy()
+                    dfh = dfh.rename(columns={sheep_col: 'Sheep', goats_col: 'Goats'})
+
+                    long = dfh.melt(id_vars=['kpmd_registered'], value_vars=['Sheep', 'Goats'],
+                                    var_name='Species', value_name='Count')
+                    long['Count'] = pd.to_numeric(long['Count'], errors='coerce')
+
+                    comp = (long.groupby(['kpmd_registered', 'Species'])['Count']
+                                .mean().reset_index())
+                    comp['KPMD_Status'] = comp['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+
+                    fig = px.bar(comp, x='KPMD_Status', y='Count', color='Species',
+                                 title='Average Herd Composition by KPMD Status', barmode='group',
+                                 text=comp['Count'].round(1))
+                    fig.update_traces(textposition='outside')
                     fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                     st.plotly_chart(fig, use_container_width=True)
                 except Exception:
@@ -1602,74 +1719,119 @@ class DashboardRenderer:
             else:
                 st.info("Herd composition data not available for visualization")
 
+        # ---------- Tab 2: Animal Health ----------
         with tab2:
             st.subheader("Animal Health Indicators")
 
-            # --- Vaccination Rate ---
-            vacc_col = self.dp.column_mapping.get('vaccination')
+            # Vaccination Rate
+            vacc_col = self.dp.column_mapping.get('vaccination') if hasattr(self.dp, 'column_mapping') else None
             if vacc_col and vacc_col in self.df.columns:
                 st.write("**Vaccination Rate**")
-                vacc_data = self.df.copy()
-                vacc_data['vaccinated'] = vacc_data[vacc_col].apply(yn).astype(int)
-                self.create_comparison_cards(vacc_data, 'vaccinated', 'Vaccination Rate', '{:.1%}')
+                base = self.df.copy()
+                v = pd.to_numeric(base[vacc_col].apply(yn), errors='coerce')
+                base['vaccinated'] = v
+                tmp = base[['kpmd_registered', 'vaccinated']].copy()
+                rows = []
+                for s in [0, 1]:
+                    sub = tmp[tmp['kpmd_registered'] == s]['vaccinated']
+                    rate = (sub.eq(1).sum() / sub.notna().sum() * 100) if sub.notna().any() else np.nan
+                    rows.append({'KPMD_Status': 'KPMD' if s == 1 else 'Non-KPMD', 'Rate': rate})
+                df_rate = pd.DataFrame(rows).dropna(subset=['Rate'])
+                if not df_rate.empty:
+                    fig = px.bar(df_rate, x='KPMD_Status', y='Rate', title='Vaccination Rate',
+                                 text=df_rate['Rate'].round(1))
+                    fig.update_traces(textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide', yaxis_title='%')
+                    st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("Vaccination data not available")
 
-            # --- Treatment Rate ---
+            # Treatment Rate
             treat_col = 'D3. Did you treat small ruminants for disease in the last month?'
             if treat_col in self.df.columns:
                 st.write("**Treatment Rate**")
-                treat_data = self.df.copy()
-                treat_data['treated'] = treat_data[treat_col].apply(yn).astype(int)
-                self.create_comparison_cards(treat_data, 'treated', 'Treatment Rate', '{:.1%}')
+                base = self.df.copy()
+                t = pd.to_numeric(base[treat_col].apply(yn), errors='coerce')
+                base['treated'] = t
+                rows = []
+                for s in [0, 1]:
+                    sub = base[base['kpmd_registered'] == s]['treated']
+                    rate = (sub.eq(1).sum() / sub.notna().sum() * 100) if sub.notna().any() else np.nan
+                    rows.append({'KPMD_Status': 'KPMD' if s == 1 else 'Non-KPMD', 'Rate': rate})
+                df_rate = pd.DataFrame(rows).dropna(subset=['Rate'])
+                if not df_rate.empty:
+                    fig = px.bar(df_rate, x='KPMD_Status', y='Rate', title='Treatment Rate',
+                                 text=df_rate['Rate'].round(1))
+                    fig.update_traces(textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide', yaxis_title='%')
+                    st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("Disease treatment data not available")
 
-            # --- Deworming Rate ---
+            # Deworming Rate
             deworm_col = 'D4. Did you deworm your small ruminants last month?'
             if deworm_col in self.df.columns:
                 st.write("**Deworming Rate**")
-                deworm_data = self.df.copy()
-                deworm_data['dewormed'] = deworm_data[deworm_col].apply(yn).astype(int)
-                self.create_comparison_cards(deworm_data, 'dewormed', 'Deworming Rate', '{:.1%}')
+                base = self.df.copy()
+                d = pd.to_numeric(base[deworm_col].apply(yn), errors='coerce')
+                base['dewormed'] = d
+                rows = []
+                for s in [0, 1]:
+                    sub = base[base['kpmd_registered'] == s]['dewormed']
+                    rate = (sub.eq(1).sum() / sub.notna().sum() * 100) if sub.notna().any() else np.nan
+                    rows.append({'KPMD_Status': 'KPMD' if s == 1 else 'Non-KPMD', 'Rate': rate})
+                df_rate = pd.DataFrame(rows).dropna(subset=['Rate'])
+                if not df_rate.empty:
+                    fig = px.bar(df_rate, x='KPMD_Status', y='Rate', title='Deworming Rate',
+                                 text=df_rate['Rate'].round(1))
+                    fig.update_traces(textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide', yaxis_title='%')
+                    st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("Deworming data not available")
 
             st.subheader("Disease Analysis")
+
+            def _disease_rates(cols):
+                rows = []
+                for col in cols:
+                    if col not in self.df.columns:
+                        continue
+                    name = col.split('/')[-1].strip()
+                    name = ' '.join(name.split())
+                    for s in [0, 1]:
+                        sub = self.df[self.df['kpmd_registered'] == s][col]
+                        v = pd.to_numeric(sub, errors='coerce')
+                        rate = (v.eq(1).sum() / v.notna().sum() * 100) if v.notna().any() else np.nan
+                        rows.append({'Disease': name,
+                                     'Rate': rate,
+                                     'KPMD_Status': 'KPMD' if s == 1 else 'Non-KPMD'})
+                dfp = pd.DataFrame(rows).dropna(subset=['Rate'])
+                if not dfp.empty:
+                    dfp = (dfp.groupby(['Disease', 'KPMD_Status'])['Rate']
+                              .mean().reset_index())
+                return dfp
+
             if hasattr(self.dp, 'vacc_disease_cols') and self.dp.vacc_disease_cols:
-                rows=[]
-                for col in self.dp.vacc_disease_cols:
-                    name = col.split('/')[-1]
-                    for s in [0,1]:
-                        sub = self.df[self.df['kpmd_registered']==s]
-                        if len(sub)>0:
-                            rate = sub[col].mean() * 100
-                            rows.append({'Disease':name,'Rate':rate,'KPMD_Status':'KPMD' if s==1 else 'Non-KPMD'})
-                if rows:
-                    dfp = pd.DataFrame(rows)
+                dfp = _disease_rates(self.dp.vacc_disease_cols)
+                if not dfp.empty:
                     fig = px.bar(dfp, x='Disease', y='Rate', color='KPMD_Status',
-                                 title='Vaccination Diseases by KPMD Status (%)', barmode='group')
-                    fig.update_traces(text=dfp['Rate'].round(1), textposition='outside')
-                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
+                                 title='Vaccination Diseases by KPMD Status (%)', barmode='group',
+                                 text=dfp['Rate'].round(1))
+                    fig.update_traces(textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide', xaxis_title='Disease', yaxis_title='%')
                     st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("Vaccination disease data not available")
 
             if hasattr(self.dp, 'treat_disease_cols') and self.dp.treat_disease_cols:
-                rows=[]
-                for col in self.dp.treat_disease_cols:
-                    name = col.split('/')[-1]
-                    for s in [0,1]:
-                        sub = self.df[self.df['kpmd_registered']==s]
-                        if len(sub)>0:
-                            rate = sub[col].mean() * 100
-                            rows.append({'Disease':name,'Rate':rate,'KPMD_Status':'KPMD' if s==1 else 'Non-KPMD'})
-                if rows:
-                    dfp = pd.DataFrame(rows)
+                dfp = _disease_rates(self.dp.treat_disease_cols)
+                if not dfp.empty:
                     fig = px.bar(dfp, x='Disease', y='Rate', color='KPMD_Status',
-                                 title='Treatment Diseases by KPMD Status (%)', barmode='group')
-                    fig.update_traces(text=dfp['Rate'].round(1), textposition='outside')
-                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
+                                 title='Treatment Diseases by KPMD Status (%)', barmode='group',
+                                 text=dfp['Rate'].round(1))
+                    fig.update_traces(textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide', xaxis_title='Disease', yaxis_title='%')
                     st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("Treatment disease data not available")
@@ -1677,47 +1839,68 @@ class DashboardRenderer:
             prov_col = 'D2. Who performed the small ruminants vaccinations in the last month?'
             if prov_col in self.df.columns:
                 try:
-                    provider_counts = self.df.groupby(['kpmd_registered', prov_col]).size().reset_index(name='count')
-                    provider_counts['KPMD_Status'] = provider_counts['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
+                    provider_counts = (self.df[['kpmd_registered', prov_col]]
+                                       .dropna(subset=[prov_col])
+                                       .groupby(['kpmd_registered', prov_col]).size()
+                                       .reset_index(name='count'))
+                    provider_counts['KPMD_Status'] = provider_counts['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
                     fig = px.bar(provider_counts, x='KPMD_Status', y='count', color=prov_col,
-                                 title='Vaccination Providers by KPMD Status')
-                    fig.update_traces(text=provider_counts['count'], textposition='outside')
-                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
+                                 title='Vaccination Providers by KPMD Status',
+                                 text=provider_counts['count'])
+                    fig.update_traces(textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide', yaxis_title='Count')
                     st.plotly_chart(fig, use_container_width=True)
                 except Exception:
                     st.info("Vaccination provider data not available")
             else:
                 st.info("Vaccination provider data not available")
 
+        # ---------- Tab 3: SR Productivity (per 100 head) ----------
         with tab3:
             st.subheader("Small Ruminant Productivity Indicators")
-            # --- Birth Rate ---
+
             if 'birth_rate_per_100' in self.df.columns:
                 st.write("**Birth Rate (per 100 head)**")
                 self.create_comparison_cards(self.df, 'birth_rate_per_100', 'Birth Rate', '{:.1f}')
-
-            # --- Mortality Rate ---
             if 'mortality_rate_per_100' in self.df.columns:
                 st.write("**Mortality Rate (per 100 head)**")
                 self.create_comparison_cards(self.df, 'mortality_rate_per_100', 'Mortality Rate', '{:.1f}')
-
-            # --- Loss Rate ---
             if 'loss_rate_per_100' in self.df.columns:
                 st.write("**Loss Rate (per 100 head)**")
                 self.create_comparison_cards(self.df, 'loss_rate_per_100', 'Loss Rate', '{:.1f}')
 
-            if all(c in self.df.columns for c in ['birth_rate_per_100','mortality_rate_per_100','loss_rate_per_100','kpmd_registered']):
+            def _weighted_mean(rate_col, weight_col, df_group):
+                r = pd.to_numeric(df_group[rate_col], errors='coerce')
+                w = pd.to_numeric(df_group[weight_col], errors='coerce')
+                if w.notna().sum() == 0 or w.fillna(0).sum() == 0:
+                    return r.mean()
+                return (r.fillna(0) * w.fillna(0)).sum() / w.fillna(0).sum()
+
+            has_rates = all(c in self.df.columns for c in
+                            ['birth_rate_per_100', 'mortality_rate_per_100', 'loss_rate_per_100'])
+            weight_col = 'total_sr' if 'total_sr' in self.df.columns else None
+
+            if has_rates and 'kpmd_registered' in self.df.columns:
                 st.subheader("Productivity Rates by KPMD Status")
                 try:
-                    prod = self.df.groupby('kpmd_registered')[['birth_rate_per_100','mortality_rate_per_100','loss_rate_per_100']].mean().reset_index()
-                    prod['KPMD_Status'] = prod['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
-                    m = prod.melt(id_vars=['KPMD_Status'],
-                                  value_vars=['birth_rate_per_100','mortality_rate_per_100','loss_rate_per_100'],
-                                  var_name='Metric', value_name='Rate')
-                    m['Metric'] = m['Metric'].map({'birth_rate_per_100':'Birth Rate','mortality_rate_per_100':'Mortality Rate','loss_rate_per_100':'Loss Rate'})
-                    fig = px.bar(m, x='KPMD_Status', y='Rate', color='Metric',
+                    rows = []
+                    for s in [0, 1]:
+                        sub = self.df[self.df['kpmd_registered'] == s]
+                        if weight_col:
+                            b = _weighted_mean('birth_rate_per_100', weight_col, sub)
+                            m = _weighted_mean('mortality_rate_per_100', weight_col, sub)
+                            l = _weighted_mean('loss_rate_per_100', weight_col, sub)
+                        else:
+                            b = pd.to_numeric(sub['birth_rate_per_100'], errors='coerce').mean()
+                            m = pd.to_numeric(sub['mortality_rate_per_100'], errors='coerce').mean()
+                            l = pd.to_numeric(sub['loss_rate_per_100'], errors='coerce').mean()
+                        rows.append({'KPMD_Status': 'KPMD' if s == 1 else 'Non-KPMD',
+                                     'Birth Rate': b, 'Mortality Rate': m, 'Loss Rate': l})
+                    prod = (pd.DataFrame(rows)
+                            .melt(id_vars=['KPMD_Status'], var_name='Metric', value_name='Rate'))
+                    fig = px.bar(prod, x='KPMD_Status', y='Rate', color='Metric',
                                  title='Productivity Rates by KPMD Status (per 100 head)', barmode='group',
-                                 text=m['Rate'].round(1))
+                                 text=prod['Rate'].round(1))
                     fig.update_traces(textposition='outside')
                     fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                     st.plotly_chart(fig, use_container_width=True)
@@ -1731,31 +1914,109 @@ class DashboardRenderer:
 
         with tab1:
             st.subheader("Feed Purchase Patterns")
-            col = 'B5a. Did you purchase fodder in the last 1 month?'
-            if col in self.df.columns:
-                tmp = self.df.copy(); tmp['purchased'] = tmp[col].apply(yn).astype(int)
+
+            # Prefer column mapping if you created one; fall back to the canonical label
+            purchase_col = self.dp.column_mapping.get('feed_purchase') or \
+                'B5a. Did you purchase fodder in the last 1 month?'
+
+            if purchase_col in self.df.columns:
+                tmp = self.df.copy()
+                tmp['purchased'] = tmp[purchase_col].apply(yn).astype(int)
                 self.create_comparison_cards(tmp, 'purchased', 'Purchase Rate', '{:.1%}')
             else:
-                st.info("Fodder purchase data not available")
+                st.info("Fodder/Feed purchase data (B5a) not available")
 
             st.subheader("Feed Purchase Sources")
-            source_cols = [c for c in self.df.columns if c.startswith('B5b. Where did you buy feeds in the last 1 month?/') and 'Other' not in c]
-            if source_cols:
-                rows=[]
-                for c in source_cols:
-                    name = c.split('/')[-1]
-                    for s in [0,1]:
-                        sub = self.df[self.df['kpmd_registered']==s]
-                        rate = pd.to_numeric(sub[c].astype(str).replace({'1':1,'0':0}), errors='coerce').fillna(0).mean() * 100 if len(sub) else 0
-                        rows.append({'Source': name, 'Rate': rate, 'KPMD_Status': 'KPMD' if s==1 else 'Non-KPMD'})
+
+            # Stem used for either one-hot columns or a single multiselect column
+            stem = 'B5b. Where did you buy feeds in the last 1 month?'
+
+            # ---------- Base = purchasers only (very important!) ----------
+            base = self.df.copy()
+            if purchase_col in base.columns:
+                base = base[base[purchase_col].apply(yn) == 1]
+
+            # Nothing to do if nobody purchased
+            if base.empty:
+                st.info("No households reported purchasing feed/fodder in the current filter.")
+                return
+
+            # Case A: one-hot columns (B5b/<source>)
+            one_hot_cols = [c for c in base.columns
+                            if c.startswith(stem + '/') and 'Other' not in c]
+
+            def _to01(s):
+                # robust 0/1 parsing
+                return pd.to_numeric(
+                    s.astype(str).str.strip()
+                    .replace({'1': 1, '0': 0, 'true': 1, 'false': 0, 'True': 1, 'False': 0}),
+                    errors='coerce'
+                ).fillna(0)
+
+            if one_hot_cols:
+                rows = []
+                for s in [0, 1]:
+                    grp = base[base['kpmd_registered'] == s]
+                    denom = len(grp)
+                    if denom == 0:
+                        continue
+                    for c in one_hot_cols:
+                        name = c.split('/')[-1].strip()
+                        rate = _to01(grp[c]).mean() * 100.0
+                        rows.append({
+                            'Source': name,
+                            'Rate': rate,
+                            'KPMD_Status': 'KPMD' if s == 1 else 'Non-KPMD',
+                            'n': denom
+                        })
                 dfp = pd.DataFrame(rows)
-                fig = px.bar(dfp, x='Source', y='Rate', color='KPMD_Status',
-                             title='Feed Purchase Sources by KPMD Status (%)', barmode='group')
-                fig.update_traces(text=dfp['Rate'].round(1), textposition='outside')
-                fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
-                st.plotly_chart(fig, use_container_width=True)
+
+                if not dfp.empty:
+                    fig = px.bar(
+                        dfp, x='Source', y='Rate', color='KPMD_Status',
+                        title='Feed Purchase Sources by KPMD Status (%)', barmode='group'
+                    )
+                    fig.update_traces(text=dfp['Rate'].round(1), textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # show denominators
+                    ns = dfp.groupby('KPMD_Status')['n'].max().to_dict()
+                    st.caption(
+                        f"Denominator = households that purchased feed in B5a. "
+                        f"(KPMD n={ns.get('KPMD', 0):,}, Non-KPMD n={ns.get('Non-KPMD', 0):,})."
+                    )
+                else:
+                    st.info("No non-zero selections found for feed sources among purchasers.")
+
+            # Case B: single multiselect text column (create dummies on the fly)
+            elif stem in base.columns:
+                dummies = one_hot_multiselect(base[stem])
+                if not dummies.empty:
+                    tmp = pd.concat([base[['kpmd_registered']], dummies], axis=1)
+                    long = tmp.melt(id_vars=['kpmd_registered'], var_name='Source', value_name='flag')
+                    agg = long.groupby(['Source', 'kpmd_registered'])['flag'].mean().mul(100).reset_index()
+                    gg['KPMD_Status'] = agg['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+
+                    fig = px.bar(
+                        agg, x='Source', y='flag', color='KPMD_Status',
+                        title='Feed Purchase Sources by KPMD Status (%)', barmode='group'
+                    )
+                    fig.update_yaxes(title='Rate')
+                    fig.update_traces(text=agg['flag'].round(1), textposition='outside')
+                    fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # denominators
+                    ns = base.groupby('kpmd_registered').size().to_dict()
+                    st.caption(
+                        f"Denominator = households that purchased feed in B5a. "
+                        f"(KPMD n={ns.get(1, 0):,}, Non-KPMD n={ns.get(0, 0):,})."
+                    )
+                else:
+                    st.info("Could not derive feed source selections from the multiselect column.")
             else:
-                st.info("Feed source data not available")
+                st.info("Feed source data (B5b) not available")
 
         with tab2:
             st.subheader("Fodder Production")
@@ -2018,38 +2279,55 @@ class DashboardRenderer:
     def render_payments(self):
         st.header("💸 Payment Methods")
 
-        def _norm(s: str) -> str: return re.sub(r'\s+', ' ', str(s)).strip().lower()
+        def _norm(s: str) -> str:
+            return re.sub(r'\s+', ' ', str(s)).strip().lower()
+
         stems = [
             ('Sheep – KPMD',  'E1g. How were you paid by the KPMD off-takers last  month? [Select all that apply]'),
             ('Goats – KPMD',  'E2g. How were you paid by the KPMD off-takers last  month? [Select all that apply]'),
             ('Sheep – Other', 'E3h. How were you paid by the non-KPMD off-takers last  month? [Select all that apply]'),
             ('Goats – Other', 'E4h. How were you paid by the non-KPMD off-takers  last  month? [Select all that apply]'),
         ]
-        rows = []; cols_norm = defaultdict(list)
+
+        rows = []
+        cols_norm = defaultdict(list)
         for c in self.df.columns:
             cols_norm[_norm(c)].append(c)
 
         for label, stem in stems:
             stem_n = _norm(stem)
-            subcols = []
-            for c in self.df.columns:
-                c_n = _norm(c)
-                if c_n.startswith(stem_n) and '/' in c: subcols.append(c)
+
+            # Find one-hot subcolumns under this stem (E*g/<option>)
+            subcols = [c for c in self.df.columns if _norm(c).startswith(stem_n) and '/' in c]
+
+            # Classify options into mobile vs cash
             mobile_cols, cash_cols = [], []
             for c in subcols:
                 suffix = _norm(c.split('/', 1)[1])
-                if ('mobile' in suffix) or ('m-pesa' in suffix) or ('mpesa' in suffix): mobile_cols.append(c)
-                if 'cash' in suffix: cash_cols.append(c)
+                if ('mobile' in suffix) or ('m-pesa' in suffix) or ('mpesa' in suffix):
+                    mobile_cols.append(c)
+                if 'cash' in suffix:
+                    cash_cols.append(c)
+
+            # Or find a single multiselect column
             cands = cols_norm.get(stem_n, [])
             single_col = max(cands, key=len) if cands else None
 
-            mobile_series = None; cash_series = None
-            if mobile_cols:
-                mobile_series = (self.df[mobile_cols].astype(str).replace({'1':1,'0':0})
-                                 .apply(pd.to_numeric, errors='coerce').fillna(0).max(axis=1))
-            if cash_cols:
-                cash_series = (self.df[cash_cols].astype(str).replace({'1':1,'0':0})
-                               .apply(pd.to_numeric, errors='coerce').fillna(0).max(axis=1))
+            # Build 0/1 series for mobile & cash
+            def _01_from_cols(df, cols):
+                if not cols:
+                    return None
+                block = (df[cols].astype(str)
+                            .replace({'1': 1, '0': 0, 'true': 1, 'false': 0, 'True': 1, 'False': 0})
+                            .apply(pd.to_numeric, errors='coerce')
+                            .fillna(0))
+                # any selected in that set
+                return (block.max(axis=1)).clip(0, 1)
+
+            mobile_series = _01_from_cols(self.df, mobile_cols)
+            cash_series   = _01_from_cols(self.df, cash_cols)
+
+            # If needed, derive from a single multiselect text col
             if (mobile_series is None or cash_series is None) and (single_col is not None):
                 dummies = one_hot_multiselect(self.df[single_col])
                 if mobile_series is None:
@@ -2058,52 +2336,135 @@ class DashboardRenderer:
                 if cash_series is None:
                     tok = next((t for t in dummies.columns if _norm(t).startswith('cash')), None)
                     cash_series = dummies.get(tok, pd.Series(0, index=self.df.index))
-            if mobile_series is None: mobile_series = pd.Series(0, index=self.df.index)
-            if cash_series is None: cash_series = pd.Series(0, index=self.df.index)
 
-            tmp_cols = ['kpmd_registered'] + (['County'] if 'County' in self.df.columns else [])
-            tmp = self.df[tmp_cols].copy()
-            tmp['block']  = label
-            tmp['mobile'] = pd.to_numeric(mobile_series, errors='coerce').fillna(0).clip(0,1).astype(int)
-            tmp['cash']   = pd.to_numeric(cash_series,   errors='coerce').fillna(0).clip(0,1).astype(int)
-            tmp['both']   = ((tmp['mobile']==1) & (tmp['cash']==1)).astype(int)
-            rows.append(tmp)
+            # Fall back to zeros if still missing
+            if mobile_series is None:
+                mobile_series = pd.Series(0, index=self.df.index)
+            if cash_series is None:
+                cash_series = pd.Series(0, index=self.df.index)
+
+            # -------- Correct denominator: only payers in this block --------
+            any_method = ((pd.to_numeric(mobile_series, errors='coerce').fillna(0) > 0) |
+                        (pd.to_numeric(cash_series,   errors='coerce').fillna(0) > 0))
+
+            base = self.df.loc[any_method].copy()
+            if base.empty:
+                # Nothing selected for this block — skip gracefully
+                continue
+
+            base['block']  = label
+            base['mobile'] = pd.to_numeric(mobile_series.loc[base.index], errors='coerce').fillna(0).clip(0, 1).astype(int)
+            base['cash']   = pd.to_numeric(cash_series.loc[base.index],   errors='coerce').fillna(0).clip(0, 1).astype(int)
+            base['both']   = ((base['mobile'] == 1) & (base['cash'] == 1)).astype(int)
+
+            # Keep County/KPMD if present
+            keep_cols = ['block', 'mobile', 'cash', 'both']
+            if 'kpmd_registered' in base.columns:
+                keep_cols.append('kpmd_registered')
+            if 'County' in base.columns:
+                keep_cols.append('County')
+
+            rows.append(base[keep_cols])
 
         if not rows:
-            st.info("No payment method columns found")
+            st.info("No payment method selections found in the current filter.")
             return
 
         payment = pd.concat(rows, ignore_index=True)
-        grp = payment.groupby(['block','kpmd_registered'], dropna=False)
+
+        # Shares are w.r.t. the correct denominator (payers in each block × KPMD)
+        grp = payment.groupby(['block', 'kpmd_registered'], dropna=False)
+        denom = grp.size().rename('n').reset_index()
         summary = pd.DataFrame({
             'Mobile share': grp['mobile'].mean() * 100,
             'Cash share':   grp['cash'].mean() * 100,
             'Both share':   grp['both'].mean() * 100
-        }).reset_index()
-        summary['KPMD Status'] = summary['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
-        long = summary.melt(id_vars=['block','KPMD Status'], value_vars=['Cash share','Mobile share','Both share'],
-                            var_name='Method', value_name='Share')
-        if long['Share'].sum() == 0 or long.dropna(subset=['Share']).empty:
-            st.warning("No non-zero payment shares detected. Check column names in your CSV."); return
-        fig = px.bar(long, x='block', y='Share', color='Method', barmode='group', facet_col='KPMD Status',
-                     title='Payment method mix by channel/species and KPMD')
+        }).reset_index().merge(denom, on=['block', 'kpmd_registered'], how='left')
+
+        summary['KPMD Status'] = summary['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+        long = summary.melt(
+            id_vars=['block', 'KPMD Status', 'n'],
+            value_vars=['Cash share', 'Mobile share', 'Both share'],
+            var_name='Method',
+            value_name='Share'
+        )
+
+        if long.dropna(subset=['Share']).empty:
+            st.warning("No non-zero payment shares detected. Check column names in your CSV.")
+            return
+
+        fig = px.bar(
+            long, x='block', y='Share', color='Method', barmode='group',
+            facet_col='KPMD Status',
+            title='Payment method mix by channel/species and KPMD'
+        )
         fig.update_traces(text=long['Share'].round(1), textposition='outside')
         fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
         st.plotly_chart(fig, use_container_width=True)
 
+        # Show denominators beneath the figure
+        cap = (long.groupby(['KPMD Status', 'block'])['n'].max()
+                    .reset_index()
+                    .sort_values(['KPMD Status', 'block']))
+        parts = [f"{r['KPMD Status']} – {r['block']}: n={int(r['n']):,}" for _, r in cap.iterrows()]
+        st.caption("Denominator = households that reported a payment method in that block. " + " | ".join(parts))
+
+        # ------------ Digital adoption (household-level, payers only) ------------
         st.subheader("Digital adoption by county (Mobile or Both)")
-        county = payment.copy(); county['digital'] = ((county['mobile']==1) | (county['both']==1)).astype(int)
-        if 'County' in county.columns:
-            county_summary = county.groupby(['County','kpmd_registered'])[['digital']].mean().mul(100).reset_index()
-            county_summary['KPMD Status'] = county_summary['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
-            if county_summary['digital'].sum() == 0:
-                st.info("No digital payments found in the data.")
+
+        # Collapse to one record per household: if they used mobile/cash anywhere, count it
+        hh = (payment
+            .groupby(['hhid','County','kpmd_registered'])[['mobile','cash','both']]
+            .max()  # any channel/species
+            .reset_index())
+
+        hh['payer']   = ((hh['mobile'] == 1) | (hh['cash'] == 1)).astype(int)
+        hh['digital'] = (hh['mobile'] == 1).astype(int)  # mobile (incl. “both”) is digital
+
+        if 'County' in hh.columns:
+            c1, c2 = st.columns([1,1])
+            with c1:
+                min_n = st.number_input("Minimum payers per County × KPMD to include",
+                                        min_value=1, max_value=200, value=5, step=1)
+            with c2:
+                show_0_100 = st.checkbox("Fix y-axis to 0–100%", value=False)
+
+            payers = hh[hh['payer'] == 1].copy()
+            if payers.empty:
+                st.info("No digital payments found among payers.")
             else:
-                fig2 = px.bar(county_summary, x='County', y='digital', color='KPMD Status',
-                              barmode='group', title='Digital share (%)')
-                fig2.update_traces(text=county_summary['digital'].round(1), textposition='outside')
-                fig2.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
-                st.plotly_chart(fig2, use_container_width=True)
+                # % digital among payers + denominators (payers only)
+                grp = payers.groupby(['County','kpmd_registered'])
+                county_summary = grp['digital'].mean().mul(100).rename('digital').reset_index()
+                county_summary['n'] = grp.size().values
+                county_summary = county_summary[county_summary['n'] >= min_n]
+                county_summary['KPMD Status'] = county_summary['kpmd_registered'].map({1:'KPMD',0:'Non-KPMD'})
+
+                if county_summary.empty or county_summary['digital'].sum() == 0:
+                    st.info("No digital payments found among payers (after filters).")
+                else:
+                    order = (county_summary.groupby('County')['digital']
+                            .mean().sort_values(ascending=False).index.tolist())
+                    county_summary['County'] = pd.Categorical(county_summary['County'],
+                                                            categories=order, ordered=True)
+                    ounty_summary = county_summary.sort_values(['County','KPMD Status'])
+
+                    fig2 = px.bar(county_summary, x='County', y='digital', color='KPMD Status',
+                                barmode='group', title='Digital share (%)',
+                                labels={'digital':'Digital share (%)'})
+                    fig2.update_traces(
+                        text=county_summary.apply(lambda r: f"{r['digital']:.1f}% (n={int(r['n'])})", axis=1),
+                        textposition='outside'
+                    )
+                    fig2.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
+                    if show_0_100:
+                        fig2.update_yaxes(range=[0, 100])
+                    st.plotly_chart(fig2, use_container_width=True)
+
+                    cap = (county_summary[['County','KPMD Status','n']]
+                        .sort_values(['County','KPMD Status']))
+                    parts = [f"{r['County']} – {r['KPMD Status']}: n={int(r['n'])}" for _, r in cap.iterrows()]
+                    st.caption("Denominator: payers only (household-level). " + " | ".join(parts))
         else:
             st.info("County column not available for county split")
 
@@ -2346,7 +2707,7 @@ class DashboardRenderer:
             fig = px.histogram(self.df, x='rcsi_30', nbins=30, title='Distribution of rCSI (30 days)')
             st.plotly_chart(fig, use_container_width=True)
 
-        # ---------------- rCSI by Registration (30-day) ---------------- 
+        # ---------------- rCSI by Registration (30-day) ----------------
         st.subheader("🍚 Food Security — Reduced Coping Strategies Index (30-day)")
 
         if 'rcsi_30' in self.df.columns and 'kpmd_registered' in self.df.columns:
