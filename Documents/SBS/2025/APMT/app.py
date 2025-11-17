@@ -2106,7 +2106,8 @@ class DashboardRenderer:
 
         price_kpmd_col, price_non_col, age_kpmd_col, age_non_col, wt_kpmd_col, wt_non_col, breed_kpmd_stem, breed_non_stem, buyers_non_stem = _sales_cols(species, kpmd_prefix, non_kpmd_prefix)
 
-        tab1, tab2, tab3, tab4 = st.tabs(["Sales Volume", "Price Analysis", "Transaction Details", "Weights • Breeds • Buyers"])
+        # Updated tabs - removed tab4 and moved content to tab3
+        tab1, tab2, tab3 = st.tabs(["Sales Volume", "Price Analysis", "Transaction Details"])
 
         # ---------- Tab 1: Sales Volume ----------
         with tab1:
@@ -2189,62 +2190,62 @@ class DashboardRenderer:
                     </div>
                     """, unsafe_allow_html=True)
 
-            # Add comprehensive visualization like in Herd Composition
-            if all(col in self.df.columns for col in [kpmd_sold_col, non_kpmd_sold_col, 'kpmd_registered']):
-                st.subheader("Sales Channel Participation by KPMD Status")
-                try:
-                    # Prepare data for visualization
-                    need = ['kpmd_registered']
-                    df_offtake = self.df[need].copy()
+                # Add comprehensive visualization like in Herd Composition
+                if all(col in self.df.columns for col in [kpmd_sold_col, non_kpmd_sold_col, 'kpmd_registered']):
+                    st.subheader("Sales Channel Participation by KPMD Status")
+                    try:
+                        # Prepare data for visualization
+                        need = ['kpmd_registered']
+                        df_offtake = self.df[need].copy()
                 
-                    # Add sales indicators
-                    if kpmd_sold_col in self.df.columns:
-                        df_offtake['KPMD_Channel'] = self.df[kpmd_sold_col].apply(yn).astype(int)
-                    if non_kpmd_sold_col in self.df.columns:
-                        df_offtake['Non_KPMD_Channel'] = self.df[non_kpmd_sold_col].apply(yn).astype(int)
+                        # Add sales indicators
+                        if kpmd_sold_col in self.df.columns:
+                            df_offtake['KPMD_Channel'] = self.df[kpmd_sold_col].apply(yn).astype(int)
+                        if non_kpmd_sold_col in self.df.columns:
+                            df_offtake['Non_KPMD_Channel'] = self.df[non_kpmd_sold_col].apply(yn).astype(int)
                 
-                    # Calculate participation rates
-                    participation_data = []
-                    for s in [0, 1]:
-                        sub = df_offtake[df_offtake['kpmd_registered'] == s]
-                        kpmd_status = 'KPMD' if s == 1 else 'Non-KPMD'
+                        # Calculate participation rates
+                        participation_data = []
+                        for s in [0, 1]:
+                            sub = df_offtake[df_offtake['kpmd_registered'] == s]
+                            kpmd_status = 'KPMD' if s == 1 else 'Non-KPMD'
                     
-                        if 'KPMD_Channel' in sub.columns:
-                            kpmd_rate = sub['KPMD_Channel'].mean() * 100
-                            participation_data.append({
-                                'KPMD_Status': kpmd_status,
-                                'Channel': 'KPMD Channel',
-                                'Participation_Rate': kpmd_rate
-                            })
+                            if 'KPMD_Channel' in sub.columns:
+                                kpmd_rate = sub['KPMD_Channel'].mean() * 100
+                                participation_data.append({
+                                    'KPMD_Status': kpmd_status,
+                                    'Channel': 'KPMD Channel',
+                                    'Participation_Rate': kpmd_rate
+                                })
                     
-                        if 'Non_KPMD_Channel' in sub.columns:
-                            non_kpmd_rate = sub['Non_KPMD_Channel'].mean() * 100
-                            participation_data.append({
-                                'KPMD_Status': kpmd_status,
-                                'Channel': 'Non-KPMD Channel',
-                                'Participation_Rate': non_kpmd_rate
-                            })
+                            if 'Non_KPMD_Channel' in sub.columns:
+                                non_kpmd_rate = sub['Non_KPMD_Channel'].mean() * 100
+                                participation_data.append({
+                                    'KPMD_Status': kpmd_status,
+                                    'Channel': 'Non-KPMD Channel',
+                                    'Participation_Rate': non_kpmd_rate
+                                })
                 
-                    if participation_data:
-                        participation_df = pd.DataFrame(participation_data)
+                        if participation_data:
+                            participation_df = pd.DataFrame(participation_data)
                     
-                        fig = px.bar(participation_df, x='KPMD_Status', y='Participation_Rate', color='Channel',
-                                    title=f'{title_species} Sales Channel Participation by KPMD Status', 
-                                    barmode='group',
-                                    text=participation_df['Participation_Rate'].round(1))
-                        fig.update_traces(textposition='outside')
-                        fig.update_layout(
-                            uniformtext_minsize=8, 
-                            uniformtext_mode='hide',
-                            yaxis_title='Participation Rate (%)',
-                            xaxis_title='KPMD Registration Status'
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
+                            fig = px.bar(participation_df, x='KPMD_Status', y='Participation_Rate', color='Channel',
+                                        title=f'{title_species} Sales Channel Participation by KPMD Status', 
+                                        barmode='group',
+                                        text=participation_df['Participation_Rate'].round(1))
+                            fig.update_traces(textposition='outside')
+                            fig.update_layout(
+                                uniformtext_minsize=8, 
+                                uniformtext_mode='hide',
+                                yaxis_title='Participation Rate (%)',
+                                xaxis_title='KPMD Registration Status'
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
                     
-                except Exception as e:
-                    st.info(f"Sales channel visualization not available: {str(e)}")
-            else:
-                st.info("Sales channel data not available for visualization")
+                    except Exception as e:
+                        st.info(f"Sales channel visualization not available: {str(e)}")
+                else:
+                    st.info("Sales channel data not available for visualization")
 
         with tab2:
             st.subheader("Price Analysis")
@@ -2337,67 +2338,160 @@ class DashboardRenderer:
                             title=f'{title_species} Age at Sale by Channel and KPMD Registration')
 
                 st.plotly_chart(fig, use_container_width=True)
+            
+                # Add means and LSMeans for Age at Sale
+                st.subheader("Age at Sale - Summary Statistics")
+                col1, col2 = st.columns(2)
+            
+                with col1:
+                    if age_kpmd_col in self.df.columns:
+                        kpmd_age_data = self.df[self.df[age_kpmd_col].notna()]
+                        if len(kpmd_age_data) > 0:
+                            kpmd_mean = to_num(kpmd_age_data[age_kpmd_col]).mean()
+                            kpmd_lsm = lsmeans_by_group(kpmd_age_data, age_kpmd_col, 'kpmd_registered', 
+                                                    self._controls_for_lsmeans(group_col='kpmd_registered'))
+                            st.metric("KPMD Channel - Mean Age", f"{kpmd_mean:.1f} months")
+                            if isinstance(kpmd_lsm, dict):
+                                st.caption(f"LSMean — KPMD: {kpmd_lsm.get(1, np.nan):.1f} | Non-KPMD: {kpmd_lsm.get(0, np.nan):.1f}")
+            
+                with col2:
+                    if age_non_col in self.df.columns:
+                        non_age_data = self.df[self.df[age_non_col].notna()]
+                        if len(non_age_data) > 0:
+                            non_mean = to_num(non_age_data[age_non_col]).mean()
+                            non_lsm = lsmeans_by_group(non_age_data, age_non_col, 'kpmd_registered',
+                                                    self._controls_for_lsmeans(group_col='kpmd_registered'))
+                            st.metric("Non-KPMD Channel - Mean Age", f"{non_mean:.1f} months")
+                            if isinstance(non_lsm, dict):
+                                st.caption(f"LSMean — KPMD: {non_lsm.get(1, np.nan):.1f} | Non-KPMD: {non_lsm.get(0, np.nan):.1f}")
             else:
                 st.info(f"Age at sale data for {title_species} not available")
 
-        with tab4:
-            st.subheader("Weights")
-            wt_rows=[]
-            if wt_kpmd_col in self.df.columns:
-                for s in [0,1]:
-                    sub = self.df[self.df['kpmd_registered']==s]
-                    w = to_num(sub[wt_kpmd_col]).dropna()
-                    wt_rows += [{'Channel':'KPMD','Weight (kg)':v,'KPMD_Status':'KPMD' if s==1 else 'Non-KPMD'} for v in w]
-            if wt_non_col in self.df.columns:
-                for s in [0,1]:
-                    sub = self.df[self.df['kpmd_registered']==s]
-                    w = to_num(sub[wt_non_col]).dropna()
-                    wt_rows += [{'Channel':'Non-KPMD','Weight (kg)':v,'KPMD_Status':'KPMD' if s==1 else 'Non-KPMD'} for v in w]
-            if wt_rows:
-                d_w = pd.DataFrame(wt_rows)
-                figw = px.box(d_w, x='Channel', y='Weight (kg)', color='KPMD_Status',
-                            title=f'{title_species} Typical Weights by Channel and KPMD Status')
-                st.plotly_chart(figw, use_container_width=True)
-            else:
-                st.info("Weight columns not available")
+        # Weights analysis with means and LSMeans
+        st.subheader("Weights")
+        wt_rows=[]
+        if wt_kpmd_col in self.df.columns:
+            for s in [0,1]:
+                sub = self.df[self.df['kpmd_registered']==s]
+                w = to_num(sub[wt_kpmd_col]).dropna()
+                wt_rows += [{'Channel':'KPMD','Weight (kg)':v,'KPMD_Status':'KPMD' if s==1 else 'Non-KPMD'} for v in w]
+        if wt_non_col in self.df.columns:
+            for s in [0,1]:
+                sub = self.df[self.df['kpmd_registered']==s]
+                w = to_num(sub[wt_non_col]).dropna()
+                wt_rows += [{'Channel':'Non-KPMD','Weight (kg)':v,'KPMD_Status':'KPMD' if s==1 else 'Non-KPMD'} for v in w]
+        if wt_rows:
+            d_w = pd.DataFrame(wt_rows)
+            figw = px.box(d_w, x='Channel', y='Weight (kg)', color='KPMD_Status',
+                        title=f'{title_species} Typical Weights by Channel and KPMD Status')
+            st.plotly_chart(figw, use_container_width=True)
+            
+            # Add means and LSMeans for Weights
+            st.subheader("Weights - Summary Statistics")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if wt_kpmd_col in self.df.columns:
+                    kpmd_wt_data = self.df[self.df[wt_kpmd_col].notna()]
+                    if len(kpmd_wt_data) > 0:
+                        kpmd_mean = to_num(kpmd_wt_data[wt_kpmd_col]).mean()
+                        kpmd_lsm = lsmeans_by_group(kpmd_wt_data, wt_kpmd_col, 'kpmd_registered',
+                                                   self._controls_for_lsmeans(group_col='kpmd_registered'))
+                        st.metric("KPMD Channel - Mean Weight", f"{kpmd_mean:.1f} kg")
+                        if isinstance(kpmd_lsm, dict):
+                            st.caption(f"LSMean — KPMD: {kpmd_lsm.get(1, np.nan):.1f} | Non-KPMD: {kpmd_lsm.get(0, np.nan):.1f}")
+            
+            with col2:
+                if wt_non_col in self.df.columns:
+                    non_wt_data = self.df[self.df[wt_non_col].notna()]
+                    if len(non_wt_data) > 0:
+                        non_mean = to_num(non_wt_data[wt_non_col]).mean()
+                        non_lsm = lsmeans_by_group(non_wt_data, wt_non_col, 'kpmd_registered',
+                                                  self._controls_for_lsmeans(group_col='kpmd_registered'))
+                        st.metric("Non-KPMD Channel - Mean Weight", f"{non_mean:.1f} kg")
+                        if isinstance(non_lsm, dict):
+                            st.caption(f"LSMean — KPMD: {non_lsm.get(1, np.nan):.1f} | Non-KPMD: {non_lsm.get(0, np.nan):.1f}")
+        else:
+            st.info("Weight columns not available")
 
-            st.subheader("Breeds Sold")
-            bkp_cols = [c for c in self.df.columns if c.startswith(breed_kpmd_stem + "/")]
-            bno_cols = [c for c in self.df.columns if c.startswith(breed_non_stem + "/")]
-            def _rate_table(cols, label):
-                rows=[]
-                for c in cols:
-                    name = c.split('/')[-1]
-                    rate = pd.to_numeric(self.df[c].astype(str).replace({'1':1,'0':0}), errors='coerce').fillna(0).mean() * 100
-                    rows.append({'Breed': name, 'Rate': rate, 'Channel': label})
-                return pd.DataFrame(rows)
-            breed_df = pd.DataFrame()
-            if bkp_cols: breed_df = pd.concat([breed_df, _rate_table(bkp_cols, 'KPMD')], ignore_index=True)
-            if bno_cols: breed_df = pd.concat([breed_df, _rate_table(bno_cols, 'Non-KPMD')], ignore_index=True)
-            if not breed_df.empty:
-                figb = px.bar(breed_df, x='Breed', y='Rate', color='Channel',
-                            barmode='group', title=f'{title_species} Breeds Sold by Channel (%)')
-                figb.update_traces(text=breed_df['Rate'].round(1), textposition='outside')
-                figb.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
-                st.plotly_chart(figb, use_container_width=True)
-            else:
-                st.info("Breed selection columns not available")
+        # MOVED FROM TAB4: Breeds analysis
+        st.subheader("Breeds Sold")
+        bkp_cols = [c for c in self.df.columns if c.startswith(breed_kpmd_stem + "/")]
+        bno_cols = [c for c in self.df.columns if c.startswith(breed_non_stem + "/")]
+        
+        def _rate_table_with_lsm(cols, label):
+            rows=[]
+            for c in cols:
+                name = c.split('/')[-1]
+                # Calculate overall rate
+                rate = pd.to_numeric(self.df[c].astype(str).replace({'1':1,'0':0}), errors='coerce').fillna(0).mean() * 100
+                
+                # Calculate LSMeans by KPMD status
+                controls = self._controls_for_lsmeans(group_col='kpmd_registered')
+                lsm = lsmeans_by_group(self.df.dropna(subset=[c]), c, 'kpmd_registered', controls) or {}
+                
+                rows.append({
+                    'Breed': name, 
+                    'Rate': rate, 
+                    'Channel': label,
+                    'LSMean_KPMD': lsm.get(1, np.nan) * 100 if isinstance(lsm, dict) else np.nan,
+                    'LSMean_NonKPMD': lsm.get(0, np.nan) * 100 if isinstance(lsm, dict) else np.nan
+                })
+            return pd.DataFrame(rows)
+        
+        breed_df = pd.DataFrame()
+        if bkp_cols: breed_df = pd.concat([breed_df, _rate_table_with_lsm(bkp_cols, 'KPMD')], ignore_index=True)
+        if bno_cols: breed_df = pd.concat([breed_df, _rate_table_with_lsm(bno_cols, 'Non-KPMD')], ignore_index=True)
+        
+        if not breed_df.empty:
+            figb = px.bar(breed_df, x='Breed', y='Rate', color='Channel',
+                        barmode='group', title=f'{title_species} Breeds Sold by Channel (%)')
+            figb.update_traces(text=breed_df['Rate'].round(1), textposition='outside')
+            figb.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
+            st.plotly_chart(figb, use_container_width=True)
+            
+            # Show LSMeans for breeds in an expander
+            with st.expander("View Breed LSMeans by KPMD Status"):
+                lsm_breed_df = breed_df[['Breed', 'Channel', 'LSMean_KPMD', 'LSMean_NonKPMD']].copy()
+                lsm_breed_df['LSMean_KPMD'] = lsm_breed_df['LSMean_KPMD'].round(1)
+                lsm_breed_df['LSMean_NonKPMD'] = lsm_breed_df['LSMean_NonKPMD'].round(1)
+                st.dataframe(lsm_breed_df, use_container_width=True)
+        else:
+            st.info("Breed selection columns not available")
 
-            st.subheader("Non-KPMD Buyer Types")
-            buyers_cols = [c for c in self.df.columns if c.startswith(buyers_non_stem + "/")]
-            if buyers_cols:
-                rows=[]
-                for c in buyers_cols:
-                    name = c.split('/')[-1]
-                    rate = pd.to_numeric(self.df[c].astype(str).replace({'1':1,'0':0}), errors='coerce').fillna(0).mean() * 100
-                    rows.append({'Buyer': name, 'Rate': rate})
-                d_buy = pd.DataFrame(rows)
-                fig_buy = px.bar(d_buy, x='Buyer', y='Rate', title='Non-KPMD Buyer Mix (%)')
-                fig_buy.update_traces(text=d_buy['Rate'].round(1), textposition='outside')
-                fig_buy.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
-                st.plotly_chart(fig_buy, use_container_width=True)
-            else:
-                st.info("Buyer mix columns not available")
+        # Buyer types analysis with means and LSMeans
+        st.subheader("Non-KPMD Buyer Types")
+        buyers_cols = [c for c in self.df.columns if c.startswith(buyers_non_stem + "/")]
+        if buyers_cols:
+            rows=[]
+            for c in buyers_cols:
+                name = c.split('/')[-1]
+                rate = pd.to_numeric(self.df[c].astype(str).replace({'1':1,'0':0}), errors='coerce').fillna(0).mean() * 100
+                
+                # Calculate LSMeans by KPMD status
+                controls = self._controls_for_lsmeans(group_col='kpmd_registered')
+                lsm = lsmeans_by_group(self.df.dropna(subset=[c]), c, 'kpmd_registered', controls) or {}
+                
+                rows.append({
+                    'Buyer': name, 
+                    'Rate': rate,
+                    'LSMean_KPMD': lsm.get(1, np.nan) * 100 if isinstance(lsm, dict) else np.nan,
+                    'LSMean_NonKPMD': lsm.get(0, np.nan) * 100 if isinstance(lsm, dict) else np.nan
+                })
+            d_buy = pd.DataFrame(rows)
+            fig_buy = px.bar(d_buy, x='Buyer', y='Rate', title='Non-KPMD Buyer Mix (%)')
+            fig_buy.update_traces(text=d_buy['Rate'].round(1), textposition='outside')
+            fig_buy.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
+            st.plotly_chart(fig_buy, use_container_width=True)
+            
+            # Show LSMeans for buyers in an expander
+            with st.expander("View Buyer LSMeans by KPMD Status"):
+                lsm_buy_df = d_buy[['Buyer', 'LSMean_KPMD', 'LSMean_NonKPMD']].copy()
+                lsm_buy_df['LSMean_KPMD'] = lsm_buy_df['LSMean_KPMD'].round(1)
+                lsm_buy_df['LSMean_NonKPMD'] = lsm_buy_df['LSMean_NonKPMD'].round(1)
+                st.dataframe(lsm_buy_df, use_container_width=True)
+        else:
+            st.info("Buyer mix columns not available")
 
     # ---------------- Payments ----------------
     def render_payments(self):
