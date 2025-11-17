@@ -2368,46 +2368,78 @@ class DashboardRenderer:
                 st.info(f"Age at sale data for {title_species} not available")
 
         # Weights analysis with means and LSMeans
+        # MOVED FROM TAB4: Weights analysis with means and LSMeans - FIXED VERSION
         st.subheader("Weights")
+
+        # Build seller flags for proper filtering
+        sold_kpmd = None
+        sold_non = None
+        if kpmd_sold_col and kpmd_sold_col in self.df.columns:
+            sold_kpmd = self.df[kpmd_sold_col].apply(yn).astype(int) == 1
+        if non_kpmd_sold_col and non_kpmd_sold_col in self.df.columns:
+            sold_non = self.df[non_kpmd_sold_col].apply(yn).astype(int) == 1
+
         wt_rows=[]
         if wt_kpmd_col in self.df.columns:
             for s in [0,1]:
+                # Only include households that actually sold to KPMD channel
                 sub = self.df[self.df['kpmd_registered']==s]
+                if sold_kpmd is not None:
+                    sub = sub[sold_kpmd]
                 w = to_num(sub[wt_kpmd_col]).dropna()
+                # Filter out unrealistic weights (likely data entry errors)
+                w = w[w.between(10, 100)]  # Reasonable weight range for small ruminants: 10-100kg
                 wt_rows += [{'Channel':'KPMD','Weight (kg)':v,'KPMD_Status':'KPMD' if s==1 else 'Non-KPMD'} for v in w]
+        
         if wt_non_col in self.df.columns:
             for s in [0,1]:
+                # Only include households that actually sold to Non-KPMD channel
                 sub = self.df[self.df['kpmd_registered']==s]
+                if sold_non is not None:
+                    sub = sub[sold_non]
                 w = to_num(sub[wt_non_col]).dropna()
+                # Filter out unrealistic weights (likely data entry errors)
+                w = w[w.between(10, 100)]  # Reasonable weight range for small ruminants: 10-100kg
                 wt_rows += [{'Channel':'Non-KPMD','Weight (kg)':v,'KPMD_Status':'KPMD' if s==1 else 'Non-KPMD'} for v in w]
+        
         if wt_rows:
             d_w = pd.DataFrame(wt_rows)
             figw = px.box(d_w, x='Channel', y='Weight (kg)', color='KPMD_Status',
                         title=f'{title_species} Typical Weights by Channel and KPMD Status')
             st.plotly_chart(figw, use_container_width=True)
-            
+    
             # Add means and LSMeans for Weights
             st.subheader("Weights - Summary Statistics")
             col1, col2 = st.columns(2)
-            
+    
             with col1:
                 if wt_kpmd_col in self.df.columns:
+                    # Filter for KPMD channel sellers only
                     kpmd_wt_data = self.df[self.df[wt_kpmd_col].notna()]
+                    if sold_kpmd is not None:
+                        kpmd_wt_data = kpmd_wt_data[sold_kpmd]
                     if len(kpmd_wt_data) > 0:
-                        kpmd_mean = to_num(kpmd_wt_data[wt_kpmd_col]).mean()
+                        weights = to_num(kpmd_wt_data[wt_kpmd_col])
+                        weights = weights[weights.between(10, 100)]  # Filter realistic weights
+                        kpmd_mean = weights.mean()
                         kpmd_lsm = lsmeans_by_group(kpmd_wt_data, wt_kpmd_col, 'kpmd_registered',
-                                                   self._controls_for_lsmeans(group_col='kpmd_registered'))
+                                           self._controls_for_lsmeans(group_col='kpmd_registered'))
                         st.metric("KPMD Channel - Mean Weight", f"{kpmd_mean:.1f} kg")
                         if isinstance(kpmd_lsm, dict):
                             st.caption(f"LSMean — KPMD: {kpmd_lsm.get(1, np.nan):.1f} | Non-KPMD: {kpmd_lsm.get(0, np.nan):.1f}")
-            
+    
             with col2:
                 if wt_non_col in self.df.columns:
+                    # Filter for Non-KPMD channel sellers only
                     non_wt_data = self.df[self.df[wt_non_col].notna()]
+                    if sold_non is not None:
+                        non_wt_data = non_wt_data[sold_non]
                     if len(non_wt_data) > 0:
-                        non_mean = to_num(non_wt_data[wt_non_col]).mean()
+                        weights = to_num(non_wt_data[wt_non_col])
+                        weights = weights[weights.between(10, 100)]  # Filter realistic weights
+                        non_mean = weights.mean()
                         non_lsm = lsmeans_by_group(non_wt_data, wt_non_col, 'kpmd_registered',
-                                                  self._controls_for_lsmeans(group_col='kpmd_registered'))
+                                                self._controls_for_lsmeans(group_col='kpmd_registered'))
                         st.metric("Non-KPMD Channel - Mean Weight", f"{non_mean:.1f} kg")
                         if isinstance(non_lsm, dict):
                             st.caption(f"LSMean — KPMD: {non_lsm.get(1, np.nan):.1f} | Non-KPMD: {non_lsm.get(0, np.nan):.1f}")
