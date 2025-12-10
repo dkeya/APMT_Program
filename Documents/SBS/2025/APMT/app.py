@@ -1,10 +1,14 @@
+# ==============================================
+# APMT DASHBOARD WITH PANEL/LONGITUDINAL DATA SUPPORT
+# ==============================================
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
+from datetime import datetime, timedelta
 import pydeck as pdk
 from pathlib import Path
 import json
@@ -12,7 +16,9 @@ import re
 import io
 import os
 import warnings
+import geopandas as gpd
 from collections import defaultdict
+from scipy import stats
 
 warnings.filterwarnings('ignore')
 
@@ -20,7 +26,7 @@ warnings.filterwarnings('ignore')
 # Configuration
 # -------------------------------------------------
 st.set_page_config(
-    page_title="APMT Project Insights",
+    page_title="APMT Panel Data Dashboard",
     page_icon="🐑",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -53,6 +59,8 @@ st.markdown("""
     .profit-positive { color: #28a745; font-weight: bold; }
     .profit-negative { color: #dc3545; font-weight: bold; }
     .lsm-note { font-size: 0.85rem; color: #555; margin-top: 0.25rem; }
+    .panel-wave { color: #6f42c1; font-weight: bold; }
+    .did-estimate { background-color: #e8f5e8; padding: 10px; border-radius: 5px; border-left: 4px solid #28a745; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -221,6 +229,285 @@ def fmt_lsmean_note(lsm):
         return ""
 
 # -------------------------------------------------
+# PANEL DATA MANAGER CLASS
+# -------------------------------------------------
+class PanelDataManager:
+    """Enhanced panel data analysis for longitudinal tracking"""
+    
+    def __init__(self, df):
+        self.df = df.copy()
+        self.panel_structure = self._detect_panel_structure()
+        self._create_panel_identifiers()
+        self._calculate_panel_metrics()
+        
+    def _detect_panel_structure(self):
+        """Detect panel data components in the dataset"""
+        structure = {
+            'is_panel': False,
+            'hhid_col': None,
+            'wave_col': None,
+            'date_col': None,
+            'waves': [],
+            'households': 0,
+            'observations_per_hh': {},
+            'time_periods': [],
+            'balanced': False
+        }
+        
+        # Detect household ID
+        hh_candidates = ['Household ID', 'household_id', 'HHID', '_id', '_uuid', 'respondent_id']
+        for col in hh_candidates:
+            if col in self.df.columns and self.df[col].notna().any():
+                structure['hhid_col'] = col
+                break
+        
+        # Detect wave/round identifier - create from date if not exists
+        wave_candidates = ['wave', 'round', 'survey_round', 'visit', 'time_period']
+        for col in wave_candidates:
+            if col in self.df.columns:
+                structure['wave_col'] = col
+                break
+        
+        # Detect date column
+        date_candidates = ['int_date', '_submission_time', 'start', 'end']
+        for col in date_candidates:
+            if col in self.df.columns and self.df[col].notna().any():
+                structure['date_col'] = col
+                break
+        
+        # Determine if panel structure exists
+        if structure['hhid_col'] and structure['date_col']:
+            structure['is_panel'] = True
+            
+            # Extract time periods from dates
+            try:
+                self.df['_date_parsed'] = pd.to_datetime(self.df[structure['date_col']], errors='coerce')
+                self.df['_month_year'] = self.df['_date_parsed'].dt.to_period('M')
+                structure['time_periods'] = sorted(self.df['_month_year'].dropna().unique())
+                structure['waves'] = [str(p) for p in structure['time_periods']]
+            except:
+                structure['is_panel'] = False
+            
+            if structure['is_panel']:
+                structure['households'] = self.df[structure['hhid_col']].nunique()
+                
+                # Calculate observations per household
+                hh_counts = self.df.groupby(structure['hhid_col']).size()
+                structure['observations_per_hh'] = {
+                    'min': int(hh_counts.min()) if len(hh_counts) > 0 else 0,
+                    'max': int(hh_counts.max()) if len(hh_counts) > 0 else 0,
+                    'mean': float(hh_counts.mean()) if len(hh_counts) > 0 else 0,
+                    'std': float(hh_counts.std()) if len(hh_counts) > 0 else 0
+                }
+                
+                # Check if panel is balanced
+                structure['balanced'] = structure['observations_per_hh']['min'] == structure['observations_per_hh']['max']
+        
+        return structure
+    
+    def _create_panel_identifiers(self):
+        """Create consistent panel identifiers"""
+        # Create or identify household ID
+        if self.panel_structure['hhid_col']:
+            self.df['panel_hhid'] = self.df[self.panel_structure['hhid_col']].astype(str).str.strip()
+        else:
+            # Create synthetic ID from location + demographics
+            id_parts = []
+            if 'County' in self.df.columns:
+                id_parts.append(self.df['County'].astype(str).str.slice(0, 3))
+            if '_GPS Coordinates_latitude' in self.df.columns:
+                lat = self.df['_GPS Coordinates_latitude'].astype(str).str.replace('.', '').str.slice(-4)
+                lon = self.df['_GPS Coordinates_longitude'].astype(str).str.replace('.', '').str.slice(-4)
+                id_parts.append(lat + lon)
+            if len(id_parts) > 0:
+                self.df['panel_hhid'] = '_'.join(id_parts)
+            else:
+                self.df['panel_hhid'] = self.df.index.astype(str)
+        
+        # Create wave identifier from date
+        if 'panel_hhid' in self.df.columns and '_month_year' in self.df.columns:
+            self.df['panel_wave'] = self.df['_month_year'].astype(str)
+            self.df['panel_wave_num'] = self.df['panel_wave'].factorize()[0] + 1
+            
+            # Create quarter identifier
+            if '_date_parsed' in self.df.columns:
+                self.df['panel_quarter'] = self.df['_date_parsed'].dt.year.astype(str) + 'Q' + self.df['_date_parsed'].dt.quarter.astype(str)
+        else:
+            self.df['panel_wave'] = 'Wave1'
+            self.df['panel_wave_num'] = 1
+        
+        # Create unique panel identifier
+        self.df['panel_id'] = self.df['panel_hhid'] + '_' + self.df['panel_wave'].astype(str)
+        
+        # Sort by household and wave for proper time series
+        self.df = self.df.sort_values(['panel_hhid', 'panel_wave'])
+    
+    def _calculate_panel_metrics(self):
+        """Calculate panel-specific metrics"""
+        if not self.panel_structure['is_panel']:
+            return self.df
+        
+        # Calculate within-household changes for key metrics
+        key_metrics = [
+            'total_sr', 'net_profit', 'rcsi_30', 'birth_rate_per_100',
+            'income_kpmd', 'income_non_kpmd', 'total_revenue', 'total_costs'
+        ]
+        
+        # Ensure the dataframe is sorted
+        self.df = self.df.sort_values(['panel_hhid', 'panel_wave_num'])
+        
+        for metric in key_metrics:
+            if metric in self.df.columns:
+                # Calculate within-household changes (difference)
+                self.df[f'{metric}_change'] = self.df.groupby('panel_hhid')[metric].diff()
+                
+                # Calculate percentage change
+                self.df[f'{metric}_pct_change'] = self.df.groupby('panel_hhid')[metric].pct_change() * 100
+                
+                # Calculate cumulative change from baseline
+                self.df[f'{metric}_cumulative'] = self.df.groupby('panel_hhid')[metric].cumsum()
+        
+        # Calculate treatment timing (for DiD)
+        if 'kpmd_registered' in self.df.columns and 'panel_wave_num' in self.df.columns:
+            # Identify when households first registered for KPMD
+            first_reg = self.df[self.df['kpmd_registered'] == 1].groupby('panel_hhid')['panel_wave_num'].min()
+            self.df['first_kpmd_wave'] = self.df['panel_hhid'].map(first_reg)
+            self.df['post_treatment'] = (
+                (self.df['panel_wave_num'] >= self.df['first_kpmd_wave']) & 
+                (self.df['first_kpmd_wave'].notna())
+            ).astype(int)
+            
+            # Create treatment group identifier
+            self.df['ever_treated'] = self.df['panel_hhid'].isin(first_reg.index).astype(int)
+            
+            # Calculate time since treatment
+            self.df['time_since_treatment'] = self.df['panel_wave_num'] - self.df['first_kpmd_wave']
+        
+        # Calculate wave-to-wave retention
+        if self.panel_structure['is_panel'] and len(self.panel_structure['waves']) > 1:
+            self._calculate_attrition_metrics()
+        
+        return self.df
+    
+    def _calculate_attrition_metrics(self):
+        """Calculate attrition and retention metrics"""
+        waves = sorted(self.df['panel_wave'].unique())
+        
+        if len(waves) > 1:
+            # Create attrition matrix
+            attrition_data = []
+            for i in range(len(waves)-1):
+                wave_from = waves[i]
+                wave_to = waves[i+1]
+                
+                hhs_from = set(self.df[self.df['panel_wave'] == wave_from]['panel_hhid'])
+                hhs_to = set(self.df[self.df['panel_wave'] == wave_to]['panel_hhid'])
+                
+                stayed = len(hhs_from.intersection(hhs_to))
+                attrited = len(hhs_from - hhs_to)
+                new = len(hhs_to - hhs_from)
+                total_from = len(hhs_from)
+                
+                attrition_data.append({
+                    'from_wave': wave_from,
+                    'to_wave': wave_to,
+                    'stayed': stayed,
+                    'attrited': attrited,
+                    'new': new,
+                    'attrition_rate': attrited / total_from * 100 if total_from > 0 else 0,
+                    'retention_rate': stayed / total_from * 100 if total_from > 0 else 0
+                })
+            
+            self.attrition_df = pd.DataFrame(attrition_data)
+    
+    def get_panel_summary(self):
+        """Generate panel data summary"""
+        if not self.panel_structure['is_panel']:
+            return "## No panel structure detected\n\nDataset appears to be cross-sectional."
+        
+        summary = f"""
+        ## 📊 Panel Data Structure
+        
+        ### Basic Information
+        - **Total Households**: {self.panel_structure['households']:,}
+        - **Total Observations**: {len(self.df):,}
+        - **Time Periods**: {len(self.panel_structure['waves'])} 
+        - **Periods Covered**: {', '.join(sorted(self.panel_structure['waves']))}
+        
+        ### Panel Characteristics
+        - **Observations per HH**: 
+          - Min: {self.panel_structure['observations_per_hh']['min']}
+          - Max: {self.panel_structure['observations_per_hh']['max']}
+          - Mean: {self.panel_structure['observations_per_hh']['mean']:.1f} ± {self.panel_structure['observations_per_hh']['std']:.1f}
+        - **Panel Type**: {'Balanced' if self.panel_structure['balanced'] else 'Unbalanced'}
+        
+        ### Data Quality
+        - **Complete Cases**: {self.df['panel_hhid'].nunique():,} households with complete data
+        - **Missing Waves**: {self._calculate_missing_waves():.1%} of possible household-wave combinations
+        """
+        
+        # Add attrition info if available
+        if hasattr(self, 'attrition_df') and not self.attrition_df.empty:
+            avg_attrition = self.attrition_df['attrition_rate'].mean()
+            summary += f"\n- **Average Attrition Rate**: {avg_attrition:.1f}% between waves"
+        
+        return summary
+    
+    def _calculate_missing_waves(self):
+        """Calculate percentage of missing household-wave combinations"""
+        if not self.panel_structure['is_panel']:
+            return 0
+        
+        # Create complete grid of all possible household-wave combinations
+        all_hhs = self.df['panel_hhid'].unique()
+        all_waves = self.df['panel_wave'].unique()
+        
+        expected_obs = len(all_hhs) * len(all_waves)
+        actual_obs = len(self.df)
+        
+        return 1 - (actual_obs / expected_obs) if expected_obs > 0 else 0
+    
+    def calculate_difference_in_differences(self, outcome_var, time_var='panel_wave_num', 
+                                          treatment_var='ever_treated', period_var='post_treatment'):
+        """Calculate Difference-in-Differences estimate"""
+        if not all(var in self.df.columns for var in [outcome_var, time_var, treatment_var, period_var]):
+            return None
+        
+        # Prepare data for DiD
+        did_data = self.df[[outcome_var, time_var, treatment_var, period_var]].dropna()
+        
+        if len(did_data) < 4:
+            return None
+        
+        # Simple DiD calculation
+        # Group means
+        means = did_data.groupby([treatment_var, period_var])[outcome_var].mean()
+        
+        if len(means) == 4:  # Need all 4 combinations
+            # Treatment group: before and after
+            treat_before = means.loc[1, 0] if (1, 0) in means.index else 0
+            treat_after = means.loc[1, 1] if (1, 1) in means.index else 0
+            
+            # Control group: before and after
+            control_before = means.loc[0, 0] if (0, 0) in means.index else 0
+            control_after = means.loc[0, 1] if (0, 1) in means.index else 0
+            
+            # DiD estimate
+            did = (treat_after - treat_before) - (control_after - control_before)
+            
+            return {
+                'did_estimate': did,
+                'treatment_before': treat_before,
+                'treatment_after': treat_after,
+                'control_before': control_before,
+                'control_after': control_after,
+                'treatment_change': treat_after - treat_before,
+                'control_change': control_after - control_before
+            }
+        
+        return None
+
+# -------------------------------------------------
 # Data Loading (Auto)
 # -------------------------------------------------
 def _resolve_data_path() -> str:
@@ -273,12 +560,11 @@ def ensure_geo_assets():
     return True
 
 # -------------------------------------------------
-# Data Cleaning, Validation & Quality (Merged, folded)
+# Data Cleaning, Validation & Quality
 # -------------------------------------------------
 def clean_and_validate(df: pd.DataFrame):
     """
     Returns: (clean_df, issues)
-    NOTE: we do not render UI here anymore; UI is in render_data_quality_section(...).
     """
     issues = []
     work = df.copy()
@@ -401,8 +687,8 @@ def render_data_quality_section(df: pd.DataFrame, issues: list):
                     },
                     yaxis={'rangemode': 'tozero'},
                     bargap=0.15,
-                    height=min(1200, max(500, 20 * (len(miss_df) > 35) + 600)),  # a bit taller if many cols
-                    margin=dict(l=60, r=30, t=60, b=260)  # big bottom margin for rotated labels
+                    height=min(1200, max(500, 20 * (len(miss_df) > 35) + 600)),
+                    margin=dict(l=60, r=30, t=60, b=260)
                 )
                 st.plotly_chart(fig, use_container_width=True)
             else:
@@ -421,11 +707,10 @@ def render_data_quality_section(df: pd.DataFrame, issues: list):
         except Exception:
             pass
 
-                # Outliers (numeric only)
+        # Outliers (numeric only)
         try:
             num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
             if num_cols:
-                # Build full counts (keep this complete for the table)
                 out_counts = []
                 for c in num_cols:
                     mask = _iqr_outlier_mask(df[c])
@@ -436,7 +721,6 @@ def render_data_quality_section(df: pd.DataFrame, issues: list):
                 nonzero = out_df[out_df['Outliers'] > 0].copy()
 
                 if not nonzero.empty:
-                    # horizontal bars scale better with long labels
                     fig2 = px.bar(
                         nonzero,
                         y='Column',
@@ -446,7 +730,7 @@ def render_data_quality_section(df: pd.DataFrame, issues: list):
                     )
                     fig2.update_layout(
                         height=min(1200, max(450, 18 * len(nonzero))),
-                        yaxis={'categoryorder': 'total ascending'}  # largest at top
+                        yaxis={'categoryorder': 'total ascending'}
                     )
                     st.plotly_chart(fig2, use_container_width=True)
                 else:
@@ -472,7 +756,7 @@ def render_data_quality_section(df: pd.DataFrame, issues: list):
             pass
 
 # -------------------------------------------------
-# Data Processor
+# Data Processor (ENHANCED FOR PANEL DATA)
 # -------------------------------------------------
 class APMTDataProcessor:
     def __init__(self, df):
@@ -483,6 +767,12 @@ class APMTDataProcessor:
         self._basic_cleanups()
         self.column_mapping = self._build_column_mapping()
         self.enhanced_standardize_data()
+        
+        # NEW: Panel data analysis
+        self.panel_manager = PanelDataManager(self.df)
+        self.df = self.panel_manager.df
+        self.is_panel_data = self.panel_manager.panel_structure['is_panel']
+        self.panel_summary = self.panel_manager.get_panel_summary()
 
     def _basic_cleanups(self):
         for col in self.df.columns:
@@ -599,6 +889,7 @@ class APMTDataProcessor:
             self.enhanced_gender_mapping()
             self.calculate_climate_resilience()
             self.calculate_food_security()  # rCSI + insurance/worry
+            self.calculate_herd_metrics()  # Added here for completeness
         except Exception as e:
             st.warning(f"Some data standardization issues occurred: {str(e)}")
             if 'month' not in self.df.columns: self.df['month'] = [f"2024-{i:02d}" for i in range(1, min(len(self.df)+1, 13))]
@@ -761,19 +1052,12 @@ class APMTDataProcessor:
     def calculate_pl_metrics(self):
         """
         Calculate Profit & Loss metrics with robust column detection.
-
-        Revenue now follows your rule strictly:
-        Household Income = (sheep_qty × sheep_price) + (goat_qty × goat_price)
-        computed separately for KPMD and Non-KPMD channels (no 'times' multiplier).
-
-        Also records which columns were used in self._income_debug for quick inspection.
         """
         try:
             z = pd.Series(0.0, index=self.df.index)
             self._income_debug = {}  # for UI debugging
 
             def _pick_qty_price(species: str, kpmd: bool):
-                # species: 'sheep' or 'goat'; kpmd: True for KPMD (E1/E2), False for Non-KPMD (E3/E4)
                 if species == 'sheep' and kpmd:
                     qty_exact  = ['E1a. How many sheep did you sell to KPMD off-takers  last month?']
                     qty_pats   = [r'^E1a\..*(how many|number).*(sheep).*sell.*KPMD', r'^E1\..*how many.*sheep.*KPMD']
@@ -795,11 +1079,9 @@ class APMTDataProcessor:
                     price_exact= ['E4d. What was the average price per goat last month?']
                     price_pats = [r'^E4d\..*(average|avg).*price.*goat', r'^E4\..*price.*goat.*non']
 
-                # exact match first
                 qty_col = next((c for c in qty_exact if c in self.df.columns), None)
                 price_col = next((c for c in price_exact if c in self.df.columns), None)
 
-                # regex fallback
                 if qty_col is None:
                     for pat in qty_pats:
                         hits = [c for c in self.df.columns if re.search(pat, c, flags=re.IGNORECASE)]
@@ -814,13 +1096,12 @@ class APMTDataProcessor:
                             break
                 return qty_col, price_col
 
-            # ---- Revenue sources (strict qty × price, no “times”) ----
+            # ---- Revenue sources ----
             sk_qty, sk_price = _pick_qty_price('sheep', True)
             gk_qty, gk_price = _pick_qty_price('goat', True)
             sn_qty, sn_price = _pick_qty_price('sheep', False)
             gn_qty, gn_price = _pick_qty_price('goat', False)
 
-            # Convert & compute
             if sk_qty and sk_price:
                 self.df['sheep_kpmd_revenue'] = to_num(self.df[sk_qty]).fillna(0) * to_num(self.df[sk_price]).fillna(0)
             else:
@@ -838,7 +1119,6 @@ class APMTDataProcessor:
             else:
                 self.df['goat_non_kpmd_revenue'] = 0.0
 
-            # Record what we used (for a quick UI debug table)
             self._income_debug['channels'] = [
                 {'Channel':'Sheep KPMD',     'Qty':sk_qty, 'Price':sk_price},
                 {'Channel':'Goat KPMD',      'Qty':gk_qty, 'Price':gk_price},
@@ -846,7 +1126,7 @@ class APMTDataProcessor:
                 {'Channel':'Goat Non-KPMD',  'Qty':gn_qty, 'Price':gn_price},
             ]
 
-            # ------ Feed income (unchanged) ------
+            # ------ Feed income ------
             if all(c in self.df.columns for c in ['B6d. At What price did you sell a 15 kg bale last month?','B6e. Number of 15 kg bales sold in the last 1 month?']):
                 self.df['fodder_revenue'] = (
                     to_num(self.df['B6d. At What price did you sell a 15 kg bale last month?']).fillna(0) *
@@ -855,7 +1135,6 @@ class APMTDataProcessor:
             elif 'fodder_revenue' not in self.df.columns:
                 self.df['fodder_revenue'] = 0.0
 
-            # Totals and segmented incomes
             revenue_components = [
                 'sheep_kpmd_revenue','goat_kpmd_revenue',
                 'sheep_non_kpmd_revenue','goat_non_kpmd_revenue','fodder_revenue'
@@ -865,7 +1144,7 @@ class APMTDataProcessor:
             self.df['income_non_kpmd'] = self.df['sheep_non_kpmd_revenue'] + self.df['goat_non_kpmd_revenue']
             self.df['income_feed']     = self.df['fodder_revenue']
 
-            # -------- Costs (same structure as before) --------
+            # -------- Costs --------
             cost_components = []
             if 'Feed_Expenditure' in self.df.columns:
                 self.df['feed_costs'] = to_num(self.df['Feed_Expenditure']).fillna(0); cost_components.append('feed_costs')
@@ -930,7 +1209,7 @@ class APMTDataProcessor:
             st.warning(f"P&L metric calculation issue: {e}")
 
 # -------------------------------------------------
-# Dashboard Renderer
+# Dashboard Renderer (ENHANCED FOR PANEL DATA)
 # -------------------------------------------------
 class DashboardRenderer:
     def __init__(self, data_processor):
@@ -941,7 +1220,7 @@ class DashboardRenderer:
         return self.dp.df
 
     def _controls_for_lsmeans(self, group_col=None):
-        candidates = ['County', 'Gender', 'total_sr', 'month']
+        candidates = ['County', 'Gender', 'total_sr', 'month', 'panel_wave']
         return [c for c in candidates if c in self.df.columns and c != group_col]
 
     def _with_kpmd_status(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -989,11 +1268,622 @@ class DashboardRenderer:
         except Exception as e:
             st.warning(f"Could not create comparison cards for {metric_col}: {e}")
 
+    # ==============================================
+    # NEW: PANEL DATA ANALYSIS SECTION
+    # ==============================================
+    
+    def render_panel_analysis(self):
+        """Panel data and longitudinal analysis"""
+        st.header("📈 Longitudinal Panel Analysis")
+        
+        if not self.dp.is_panel_data:
+            st.info("""
+            ### No panel data structure detected
+            
+            To enable longitudinal analysis, your dataset needs:
+            1. **Household ID** column (e.g., 'household_id', 'HHID')
+            2. **Time period** information (date column)
+            
+            Current dataset appears to be cross-sectional or missing identifiers.
+            """)
+            
+            # Show what we detected
+            with st.expander("Data Structure Details"):
+                st.write("**Available Columns:**", list(self.df.columns)[:20])
+                if 'Household ID' in self.df.columns:
+                    st.write(f"**Household ID detected:** Yes ({self.df['Household ID'].nunique()} unique households)")
+                if 'int_date' in self.df.columns:
+                    st.write(f"**Date column detected:** Yes ({self.df['int_date'].nunique()} unique dates)")
+            
+            return
+        
+        # Panel summary
+        with st.expander("📊 Panel Data Structure", expanded=True):
+            st.markdown(self.dp.panel_summary)
+            
+            # Show wave distribution
+            if 'panel_wave' in self.df.columns:
+                wave_counts = self.df['panel_wave'].value_counts().sort_index()
+                fig = px.bar(x=wave_counts.index, y=wave_counts.values,
+                            title='Observations per Time Period',
+                            labels={'x': 'Time Period', 'y': 'Number of Observations'})
+                st.plotly_chart(fig, use_container_width=True)
+        
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "Household Trajectories", 
+            "Difference-in-Differences",
+            "Attrition Analysis",
+            "Wave Comparisons",
+            "Time-Series Analysis"
+        ])
+        
+        with tab1:
+            self._render_household_trajectories()
+        
+        with tab2:
+            self._render_difference_in_differences()
+        
+        with tab3:
+            self._render_attrition_analysis()
+        
+        with tab4:
+            self._render_wave_comparisons()
+        
+        with tab5:
+            self._render_time_series_analysis()
+    
+    def _render_household_trajectories(self):
+        """Spaghetti plots for household trajectories"""
+        st.subheader("Household Trajectories Over Time")
+        
+        # Select metric to track
+        metric_options = [
+            'total_sr', 'net_profit', 'rcsi_30', 'birth_rate_per_100',
+            'income_kpmd', 'income_non_kpmd', 'total_revenue', 'total_costs'
+        ]
+        available_metrics = [m for m in metric_options if m in self.df.columns]
+        
+        if not available_metrics:
+            st.info("No trajectory metrics available")
+            return
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            selected_metric = st.selectbox("Select metric to track", available_metrics)
+        with col2:
+            # Add filter for treatment status
+            show_treated_only = st.checkbox("Show treated households only", value=False)
+        
+        # Filter data if needed
+        plot_data = self.df.copy()
+        if show_treated_only and 'ever_treated' in plot_data.columns:
+            plot_data = plot_data[plot_data['ever_treated'] == 1]
+        
+        # Limit number of households for readability
+        unique_hhs = plot_data['panel_hhid'].unique()
+        if len(unique_hhs) > 30:
+            st.warning(f"Showing 30 random households out of {len(unique_hhs)} for clarity")
+            sample_hhs = np.random.choice(unique_hhs, 30, replace=False)
+            plot_data = plot_data[plot_data['panel_hhid'].isin(sample_hhs)]
+        
+        # Create spaghetti plot
+        fig = px.line(
+            plot_data,
+            x='panel_wave',
+            y=selected_metric,
+            color='panel_hhid',
+            title=f'{selected_metric.replace("_", " ").title()} Trajectories',
+            labels={'panel_wave': 'Time Period', selected_metric: selected_metric.replace('_', ' ').title()},
+            hover_data=['County', 'kpmd_registered'] if 'County' in plot_data.columns else None
+        )
+        
+        # Add treatment status if available
+        if 'kpmd_registered' in plot_data.columns:
+            # Group by treatment status for average lines
+            avg_by_wave = plot_data.groupby(['panel_wave', 'kpmd_registered'])[selected_metric].mean().reset_index()
+            avg_by_wave['KPMD Status'] = avg_by_wave['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=avg_by_wave[avg_by_wave['kpmd_registered'] == 1]['panel_wave'],
+                    y=avg_by_wave[avg_by_wave['kpmd_registered'] == 1][selected_metric],
+                    mode='lines+markers',
+                    line=dict(width=4, color='red', dash='dash'),
+                    name='KPMD Average',
+                    showlegend=True
+                )
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=avg_by_wave[avg_by_wave['kpmd_registered'] == 0]['panel_wave'],
+                    y=avg_by_wave[avg_by_wave['kpmd_registered'] == 0][selected_metric],
+                    mode='lines+markers',
+                    line=dict(width=4, color='blue', dash='dash'),
+                    name='Non-KPMD Average',
+                    showlegend=True
+                )
+            )
+        
+        fig.update_layout(
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Show household-level change statistics
+        if f'{selected_metric}_change' in self.df.columns:
+            st.subheader(f"Change in {selected_metric.replace('_', ' ').title()}")
+            
+            change_data = self.df[['panel_hhid', 'panel_wave', 'kpmd_registered', f'{selected_metric}_change']].dropna()
+            if len(change_data) > 0:
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    avg_change = change_data[f'{selected_metric}_change'].mean()
+                    st.metric("Average Change", f"{avg_change:+.2f}")
+                
+                with col2:
+                    kpmd_change = change_data[change_data['kpmd_registered'] == 1][f'{selected_metric}_change'].mean()
+                    st.metric("KPMD Change", f"{kpmd_change:+.2f}")
+                
+                with col3:
+                    non_kpmd_change = change_data[change_data['kpmd_registered'] == 0][f'{selected_metric}_change'].mean()
+                    st.metric("Non-KPMD Change", f"{non_kpmd_change:+.2f}")
+                
+                with col4:
+                    # Count positive vs negative changes
+                    positive = (change_data[f'{selected_metric}_change'] > 0).sum()
+                    total = len(change_data)
+                    pct_positive = (positive / total * 100) if total > 0 else 0
+                    st.metric("Improving", f"{pct_positive:.1f}%")
+                
+                # Distribution of changes
+                fig_change = px.histogram(change_data, x=f'{selected_metric}_change',
+                                         color='kpmd_registered',
+                                         nbins=30,
+                                         title=f'Distribution of Changes in {selected_metric.replace("_", " ").title()}',
+                                         barmode='overlay',
+                                         opacity=0.7,
+                                         labels={'kpmd_registered': 'KPMD Registered',
+                                                 f'{selected_metric}_change': 'Change'})
+                st.plotly_chart(fig_change, use_container_width=True)
+    
+    def _render_difference_in_differences(self):
+        """Difference-in-Differences analysis"""
+        st.subheader("Difference-in-Differences Analysis")
+        
+        if 'post_treatment' not in self.df.columns or 'ever_treated' not in self.df.columns:
+            st.info("DiD requires treatment timing information. Ensure KPMD registration dates are available.")
+            return
+        
+        # Select outcome variable
+        outcome_options = [
+            'net_profit', 'total_revenue', 'rcsi_30', 'total_sr',
+            'income_kpmd', 'income_non_kpmd', 'profit_margin'
+        ]
+        available_outcomes = [o for o in outcome_options if o in self.df.columns]
+        
+        if not available_outcomes:
+            st.info("No outcome variables available for DiD")
+            return
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            selected_outcome = st.selectbox("Select outcome variable", available_outcomes)
+        with col2:
+            # Add control for time period
+            time_periods = sorted(self.df['panel_wave'].unique())
+            if len(time_periods) >= 2:
+                before_period = st.selectbox("Before period", time_periods[:-1], index=0)
+                after_period = st.selectbox("After period", time_periods[1:], index=len(time_periods)-2)
+            else:
+                st.info("Need at least 2 time periods for DiD")
+                return
+        
+        # Filter data for selected periods
+        did_data = self.df[self.df['panel_wave'].isin([before_period, after_period])].copy()
+        did_data['period'] = did_data['panel_wave'].apply(lambda x: 'after' if x == after_period else 'before')
+        
+        # Calculate DiD
+        did_result = self.dp.panel_manager.calculate_difference_in_differences(
+            selected_outcome, 
+            time_var='period',
+            treatment_var='ever_treated',
+            period_var='period'
+        )
+        
+        if did_result:
+            st.markdown("### DiD Results")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Treatment Group (KPMD)**")
+                st.metric(f"Before ({before_period})", f"{did_result['treatment_before']:.2f}")
+                st.metric(f"After ({after_period})", f"{did_result['treatment_after']:.2f}")
+                st.metric("Change", f"{did_result['treatment_change']:+.2f}")
+            
+            with col2:
+                st.markdown("**Control Group (Non-KPMD)**")
+                st.metric(f"Before ({before_period})", f"{did_result['control_before']:.2f}")
+                st.metric(f"After ({after_period})", f"{did_result['control_after']:.2f}")
+                st.metric("Change", f"{did_result['control_change']:+.2f}")
+            
+            st.markdown(f"### **DiD Estimate: {did_result['did_estimate']:+.2f}**")
+            
+            if did_result['did_estimate'] > 0:
+                st.success(f"KPMD program increased {selected_outcome.replace('_', ' ')} by {did_result['did_estimate']:.2f}")
+            else:
+                st.warning(f"KPMD program decreased {selected_outcome.replace('_', ' ')} by {abs(did_result['did_estimate']):.2f}")
+            
+            # Visualize DiD
+            fig = go.Figure()
+            
+            # Treatment group line
+            fig.add_trace(go.Scatter(
+                x=['Before', 'After'],
+                y=[did_result['treatment_before'], did_result['treatment_after']],
+                mode='lines+markers',
+                name='Treatment (KPMD)',
+                line=dict(color='red', width=3)
+            ))
+            
+            # Control group line
+            fig.add_trace(go.Scatter(
+                x=['Before', 'After'],
+                y=[did_result['control_before'], did_result['control_after']],
+                mode='lines+markers',
+                name='Control (Non-KPMD)',
+                line=dict(color='blue', width=3)
+            ))
+            
+            # Add parallel trends assumption lines
+            fig.add_shape(
+                type="line",
+                x0=0, y0=did_result['treatment_before'],
+                x1=1, y1=did_result['control_before'] + (did_result['treatment_before'] - did_result['control_before']),
+                line=dict(color="gray", width=2, dash="dash"),
+                name="Parallel Trends Assumption"
+            )
+            
+            fig.update_layout(
+                title=f"Difference-in-Differences: {selected_outcome.replace('_', ' ').title()}",
+                xaxis_title="Time Period",
+                yaxis_title=selected_outcome.replace('_', ' ').title(),
+                showlegend=True
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Statistical test
+            st.subheader("Statistical Significance")
+            
+            # Perform t-test for DiD
+            treat_before_data = did_data[(did_data['ever_treated'] == 1) & (did_data['period'] == 'before')][selected_outcome]
+            treat_after_data = did_data[(did_data['ever_treated'] == 1) & (did_data['period'] == 'after')][selected_outcome]
+            control_before_data = did_data[(did_data['ever_treated'] == 0) & (did_data['period'] == 'before')][selected_outcome]
+            control_after_data = did_data[(did_data['ever_treated'] == 0) & (did_data['period'] == 'after')][selected_outcome]
+            
+            if len(treat_before_data) > 5 and len(treat_after_data) > 5 and len(control_before_data) > 5 and len(control_after_data) > 5:
+                # Test for treatment effect
+                from scipy import stats
+                
+                # Calculate DiD manually for each observation
+                did_observations = []
+                for hhid in did_data['panel_hhid'].unique():
+                    hh_data = did_data[did_data['panel_hhid'] == hhid]
+                    if len(hh_data) == 2:  # Has both before and after
+                        before_val = hh_data[hh_data['period'] == 'before'][selected_outcome].values
+                        after_val = hh_data[hh_data['period'] == 'after'][selected_outcome].values
+                        if len(before_val) > 0 and len(after_val) > 0:
+                            change = after_val[0] - before_val[0]
+                            treated = hh_data['ever_treated'].iloc[0]
+                            did_observations.append({'change': change, 'treated': treated})
+                
+                if len(did_observations) > 10:
+                    did_df = pd.DataFrame(did_observations)
+                    treat_changes = did_df[did_df['treated'] == 1]['change']
+                    control_changes = did_df[did_df['treated'] == 0]['change']
+                    
+                    t_stat, p_value = stats.ttest_ind(treat_changes, control_changes, equal_var=False)
+                    
+                    st.markdown(f"**T-test for DiD: t = {t_stat:.3f}, p = {p_value:.4f}**")
+                    if p_value < 0.05:
+                        st.success("Statistically significant treatment effect (p < 0.05)")
+                    elif p_value < 0.1:
+                        st.warning("Marginally significant treatment effect (p < 0.1)")
+                    else:
+                        st.info("No statistically significant treatment effect")
+    
+    def _render_attrition_analysis(self):
+        """Analyze attrition between waves"""
+        st.subheader("Attrition Analysis")
+        
+        if not self.dp.is_panel_data:
+            st.info("Panel structure required for attrition analysis")
+            return
+        
+        if not hasattr(self.dp.panel_manager, 'attrition_df') or self.dp.panel_manager.attrition_df.empty:
+            st.info("Need at least 2 time periods for attrition analysis")
+            return
+        
+        attrition_df = self.dp.panel_manager.attrition_df
+        
+        st.markdown("### Household Transitions Between Time Periods")
+        st.dataframe(attrition_df.style.format({
+            'attrition_rate': '{:.1f}%',
+            'retention_rate': '{:.1f}%'
+        }))
+        
+        # Plot attrition rates
+        fig1 = px.bar(
+            attrition_df,
+            x='from_wave',
+            y='attrition_rate',
+            title='Attrition Rate Between Time Periods',
+            text=attrition_df['attrition_rate'].round(1),
+            labels={'from_wave': 'From Period', 'attrition_rate': 'Attrition Rate (%)'}
+        )
+        fig1.update_traces(textposition='outside')
+        st.plotly_chart(fig1, use_container_width=True)
+        
+        # Plot retention rates
+        fig2 = px.bar(
+            attrition_df,
+            x='from_wave',
+            y='retention_rate',
+            title='Retention Rate Between Time Periods',
+            text=attrition_df['retention_rate'].round(1),
+            labels={'from_wave': 'From Period', 'retention_rate': 'Retention Rate (%)'}
+        )
+        fig2.update_traces(textposition='outside')
+        st.plotly_chart(fig2, use_container_width=True)
+        
+        # Analyze characteristics of attrited vs. stayed households
+        st.markdown("### Characteristics: Stayed vs. Attrited Households")
+        
+        if len(self.dp.panel_manager.panel_structure['waves']) >= 2:
+            first_wave = self.dp.panel_manager.panel_structure['waves'][0]
+            last_wave = self.dp.panel_manager.panel_structure['waves'][-1]
+            
+            first_wave_hhs = set(self.df[self.df['panel_wave'] == first_wave]['panel_hhid'])
+            last_wave_hhs = set(self.df[self.df['panel_wave'] == last_wave]['panel_hhid'])
+            
+            stayed_hhs = first_wave_hhs.intersection(last_wave_hhs)
+            attrited_hhs = first_wave_hhs - last_wave_hhs
+            
+            # Compare characteristics
+            first_wave_data = self.df[self.df['panel_wave'] == first_wave].copy()
+            first_wave_data['attrition_status'] = first_wave_data['panel_hhid'].apply(
+                lambda x: 'Stayed' if x in stayed_hhs else ('Attrited' if x in attrited_hhs else 'Other')
+            )
+            
+            comparison_metrics = ['total_sr', 'net_profit', 'kpmd_registered', 'rcsi_30']
+            available_metrics = [m for m in comparison_metrics if m in first_wave_data.columns]
+            
+            for metric in available_metrics:
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    stayed_mean = first_wave_data[first_wave_data['attrition_status'] == 'Stayed'][metric].mean()
+                    st.metric(f"Stayed - {metric}", f"{stayed_mean:.2f}")
+                with col2:
+                    attrited_mean = first_wave_data[first_wave_data['attrition_status'] == 'Attrited'][metric].mean()
+                    st.metric(f"Attrited - {metric}", f"{attrited_mean:.2f}")
+                with col3:
+                    diff = stayed_mean - attrited_mean
+                    st.metric("Difference", f"{diff:+.2f}")
+    
+    def _render_wave_comparisons(self):
+        """Compare metrics across waves"""
+        st.subheader("Time Period Comparisons")
+        
+        if not self.dp.is_panel_data:
+            st.info("Panel structure required for wave comparisons")
+            return
+        
+        # Select metrics to compare
+        metric_options = [
+            'net_profit', 'total_revenue', 'rcsi_30', 'total_sr',
+            'kpmd_registered', 'income_kpmd', 'income_non_kpmd',
+            'birth_rate_per_100', 'mortality_rate_per_100'
+        ]
+        available_metrics = [m for m in metric_options if m in self.df.columns]
+        
+        if not available_metrics:
+            st.info("No metrics available for time period comparison")
+            return
+        
+        selected_metrics = st.multiselect(
+            "Select metrics to compare across time periods",
+            available_metrics,
+            default=available_metrics[:3] if len(available_metrics) >= 3 else available_metrics
+        )
+        
+        if not selected_metrics:
+            return
+        
+        # Create time period comparison plots
+        for metric in selected_metrics:
+            st.markdown(f"### {metric.replace('_', ' ').title()}")
+            
+            # Calculate means by wave and KPMD status
+            wave_means = self.df.groupby(['panel_wave', 'kpmd_registered'])[metric].mean().reset_index()
+            wave_means['KPMD Status'] = wave_means['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+            
+            fig = px.line(
+                wave_means,
+                x='panel_wave',
+                y=metric,
+                color='KPMD Status',
+                markers=True,
+                title=f'{metric.replace("_", " ").title()} by Time Period and KPMD Status',
+                labels={'panel_wave': 'Time Period', metric: metric.replace('_', ' ').title()}
+            )
+            
+            # Add bar chart for overall wave means
+            overall_means = self.df.groupby('panel_wave')[metric].mean().reset_index()
+            fig.add_trace(
+                go.Bar(
+                    x=overall_means['panel_wave'],
+                    y=overall_means[metric],
+                    name='Overall Mean',
+                    opacity=0.3,
+                    marker_color='gray'
+                )
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Show table of values
+            with st.expander(f"View data for {metric}"):
+                pivot_table = wave_means.pivot(index='panel_wave', columns='KPMD Status', values=metric)
+                st.dataframe(pivot_table.style.format("{:.2f}"))
+        
+        # Statistical test for time period differences
+        st.markdown("### Statistical Tests for Time Period Differences")
+        
+        if len(selected_metrics) > 0 and len(self.df['panel_wave'].unique()) >= 2:
+            test_metric = selected_metrics[0]
+            
+            waves = sorted(self.df['panel_wave'].unique())
+            if len(waves) >= 2:
+                wave1_data = self.df[self.df['panel_wave'] == waves[0]][test_metric].dropna()
+                wave2_data = self.df[self.df['panel_wave'] == waves[-1]][test_metric].dropna()
+                
+                if len(wave1_data) > 5 and len(wave2_data) > 5:
+                    t_stat, p_value = stats.ttest_ind(wave1_data, wave2_data, equal_var=False)
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric(f"{waves[0]} Mean", f"{wave1_data.mean():.2f}")
+                    with col2:
+                        st.metric(f"{waves[-1]} Mean", f"{wave2_data.mean():.2f}")
+                    with col3:
+                        st.metric("Difference", f"{wave2_data.mean() - wave1_data.mean():+.2f}")
+                    with col4:
+                        st.metric("P-value", f"{p_value:.4f}")
+                    
+                    if p_value < 0.05:
+                        st.success(f"Statistically significant difference between {waves[0]} and {waves[-1]} (p < 0.05)")
+                    else:
+                        st.info(f"No statistically significant difference between {waves[0]} and {waves[-1]}")
+    
+    def _render_time_series_analysis(self):
+        """Time series analysis for panel data"""
+        st.subheader("Time-Series Analysis")
+        
+        if not self.dp.is_panel_data:
+            st.info("Panel structure required for time-series analysis")
+            return
+        
+        # Select variables for analysis
+        variable_options = [
+            'net_profit', 'total_revenue', 'total_costs', 'rcsi_30',
+            'total_sr', 'income_kpmd', 'income_non_kpmd'
+        ]
+        available_vars = [v for v in variable_options if v in self.df.columns]
+        
+        if not available_vars:
+            st.info("No variables available for time-series analysis")
+            return
+        
+        selected_vars = st.multiselect(
+            "Select variables for time-series analysis",
+            available_vars,
+            default=available_vars[:2] if len(available_vars) >= 2 else available_vars
+        )
+        
+        if not selected_vars:
+            return
+        
+        # Create time series plots
+        for var in selected_vars:
+            st.markdown(f"### {var.replace('_', ' ').title()}")
+            
+            # Time series with confidence intervals
+            ts_data = self.df.groupby('panel_wave')[var].agg(['mean', 'std', 'count']).reset_index()
+            ts_data['ci_lower'] = ts_data['mean'] - 1.96 * ts_data['std'] / np.sqrt(ts_data['count'])
+            ts_data['ci_upper'] = ts_data['mean'] + 1.96 * ts_data['std'] / np.sqrt(ts_data['count'])
+            
+            fig = go.Figure()
+            
+            # Add mean line
+            fig.add_trace(go.Scatter(
+                x=ts_data['panel_wave'],
+                y=ts_data['mean'],
+                mode='lines+markers',
+                name='Mean',
+                line=dict(color='blue', width=2)
+            ))
+            
+            # Add confidence interval
+            fig.add_trace(go.Scatter(
+                x=ts_data['panel_wave'].tolist() + ts_data['panel_wave'].tolist()[::-1],
+                y=ts_data['ci_upper'].tolist() + ts_data['ci_lower'].tolist()[::-1],
+                fill='toself',
+                fillcolor='rgba(0, 100, 255, 0.2)',
+                line=dict(color='rgba(255,255,255,0)'),
+                name='95% CI',
+                showlegend=True
+            ))
+            
+            fig.update_layout(
+                title=f'{var.replace("_", " ").title()} Time Series with Confidence Intervals',
+                xaxis_title='Time Period',
+                yaxis_title=var.replace('_', ' ').title(),
+                hovermode='x unified'
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Growth rate calculation
+            if len(ts_data) > 1:
+                growth_rates = []
+                for i in range(1, len(ts_data)):
+                    growth = ((ts_data['mean'].iloc[i] - ts_data['mean'].iloc[i-1]) / 
+                             ts_data['mean'].iloc[i-1] * 100) if ts_data['mean'].iloc[i-1] != 0 else 0
+                    growth_rates.append({
+                        'period': f"{ts_data['panel_wave'].iloc[i-1]} to {ts_data['panel_wave'].iloc[i]}",
+                        'growth_rate': growth
+                    })
+                
+                if growth_rates:
+                    growth_df = pd.DataFrame(growth_rates)
+                    st.markdown("**Period-to-Period Growth Rates**")
+                    st.dataframe(growth_df.style.format({'growth_rate': '{:.2f}%'}))
+                    
+                    # Calculate average growth rate
+                    avg_growth = growth_df['growth_rate'].mean()
+                    st.metric("Average Growth Rate", f"{avg_growth:.2f}%")
+
+    # ==============================================
+    # EXISTING FUNCTIONALITY (ALL PRESERVED)
+    # ==============================================
+
     # ---------------- Pastoral Livelihoods ----------------
     def render_pastoral_livelihoods(self):
         st.header("🏠 Pastoral Livelihoods")
         self.dp.calculate_pl_metrics()
 
+        # ENHANCED: Add time period selector for panel data
+        if self.dp.is_panel_data and 'panel_wave' in self.df.columns:
+            st.sidebar.markdown("---")
+            st.sidebar.subheader("📅 Time Period Selection")
+            
+            # Get unique time periods
+            time_periods = sorted(self.df['panel_wave'].unique())
+            selected_periods = st.sidebar.multiselect(
+                "Select time periods to include",
+                time_periods,
+                default=time_periods
+            )
+            
+            # Filter data if periods selected
+            if selected_periods:
+                original_df = self.df.copy()
+                self.df = self.df[self.df['panel_wave'].isin(selected_periods)]
+        
         tab1, tab2, tab3 = st.tabs([
             "Household Income Segmentation (Monthly)",
             "Access to Markets",
@@ -1010,6 +1900,11 @@ class DashboardRenderer:
         # --- Tab 1: Income Segmentation ---
         with tab1:
             st.subheader("Household Income Segmentation (Monthly)")
+            
+            # ENHANCED: Show time period info if panel data
+            if self.dp.is_panel_data and 'panel_wave' in self.df.columns:
+                period_info = self.df['panel_wave'].value_counts().sort_index()
+                st.caption(f"**Time periods included:** {', '.join(period_info.index)} (Total observations: {len(self.df)})")
 
             # Use the numeric columns produced by calculate_pl_metrics
             income_cols_map = {
@@ -1043,6 +1938,22 @@ class DashboardRenderer:
                     fig = px.pie(values=list(vals), names=list(names), title='Average Household Income Mix')
                     st.plotly_chart(fig, use_container_width=True)
 
+                # ENHANCED: Time series view if panel data
+                if self.dp.is_panel_data and 'panel_wave' in self.df.columns:
+                    st.subheader("Income Trends Over Time")
+                    
+                    # Prepare time series data
+                    ts_income = self.df.groupby(['panel_wave', 'kpmd_registered'])[list(income_cols_map.keys())].mean().reset_index()
+                    ts_income['KPMD Status'] = ts_income['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+                    
+                    # Plot each income source
+                    for income_source, label in income_cols_map.items():
+                        if income_source in ts_income.columns:
+                            fig_ts = px.line(ts_income, x='panel_wave', y=income_source, color='KPMD Status',
+                                           title=f'{label} Trends Over Time',
+                                           markers=True)
+                            st.plotly_chart(fig_ts, use_container_width=True)
+
                 # Grouped bar: mean by KPMD
                 melted = (
                     inc.rename(columns=income_cols_map)
@@ -1072,7 +1983,6 @@ class DashboardRenderer:
                 for col, label in income_cols_map.items():
                     df_lsm = inc[['kpmd_registered', col]].dropna()
                     if len(df_lsm) >= 2 and df_lsm[col].var() > 0:
-                        # NOTE: positional args; no keyword names
                         lsm = lsmeans_by_group(df_lsm, col, 'kpmd_registered', controls)
                         if isinstance(lsm, dict):
                             ls_notes.append(
@@ -1116,7 +2026,6 @@ class DashboardRenderer:
         with tab3:
             st.subheader("Price Information Access")
 
-            # Try multiple plausible column names/variants
             f2 = coalesce_first(
                 self.df,
                 [
@@ -1134,40 +2043,33 @@ class DashboardRenderer:
                 try:
                     tmp = self.df.copy()
 
-                    # robust yes/no parser
                     s = tmp[f2].astype(str).str.strip().str.lower()
                     mapped = s.map({
                         'yes': 1, 'y': 1, 'true': 1, 't': 1, '1': 1, 'ndio': 1, 'ndiyo': 1,
                         'no': 0, 'n': 0, 'false': 0, 'f': 0, '0': 0, 'la': 0, 'hapana': 0
                     })
 
-                    # if mapping failed (all NaN), try numeric > 0 => 1
                     if mapped.notna().sum() == 0:
                         as_num = pd.to_numeric(tmp[f2], errors='coerce')
                         mapped = (as_num > 0).astype('Int64')
 
-                    # Use only respondents who were actually asked (non-null in source)
                     mask = tmp[f2].notna()
                     tmp = tmp.loc[mask].copy()
                     tmp['price_info'] = mapped.loc[mask].fillna(0).astype(int)
 
-                    # Show quick raw distribution to verify parsing
                     with st.expander("Debug: raw responses for price info (F2)", expanded=False):
                         vc = self.df[f2].value_counts(dropna=False)
                         st.write(vc.to_frame('count'))
 
-                    # Comparison cards (denominator = respondents with F2 present)
                     self.create_comparison_cards(
                         tmp, 'price_info', 'Households Accessing Price Info', '{:.1%}'
                     )
 
-                    # Small note on denominator to avoid confusion
                     st.caption(
                         f"Denominator uses households with a valid response in **{f2}** "
                         f"(n={len(tmp):,})."
                     )
 
-                    # Optional: warn if everything is zero after robust parsing
                     if tmp['price_info'].sum() == 0 and len(tmp) > 0:
                         st.info(
                             "All valid responses are 'No' (or 0) in the current filter. "
@@ -1178,10 +2080,18 @@ class DashboardRenderer:
                     st.warning(f"Error processing Price Information Access: {e}")
             else:
                 st.info("F2 (price information) not found in this dataset.")
+                
+        # Restore original dataframe if we filtered it
+        if self.dp.is_panel_data and 'original_df' in locals():
+            self.df = original_df
 
     # ---------------- KPMD Participation ----------------
     def render_kpmd_participation(self):
         st.header("🤝 KPMD Participation")
+        
+        # ENHANCED: Add time period info for panel data
+        if self.dp.is_panel_data and 'panel_wave' in self.df.columns:
+            st.caption(f"**Analysis across:** {self.df['panel_wave'].nunique()} time periods")
 
         months_col = coalesce_first(self.df, ['A9. For how many months have you been participating in KPMD?'])
         if months_col:
@@ -1241,6 +2151,23 @@ class DashboardRenderer:
         st.header("💰 Profit & Loss Analysis")
         self.dp.calculate_pl_metrics()
 
+        # ENHANCED: Add time period selector for panel data
+        if self.dp.is_panel_data and 'panel_wave' in self.df.columns:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.subheader("Overall Profitability")
+            with col2:
+                selected_wave = st.selectbox(
+                    "Select time period",
+                    ["All periods"] + sorted(self.df['panel_wave'].unique().tolist()),
+                    key="pl_wave_select"
+                )
+                
+                if selected_wave != "All periods":
+                    original_df = self.df.copy()
+                    self.df = self.df[self.df['panel_wave'] == selected_wave]
+                    st.caption(f"Showing data for: {selected_wave}")
+
         tab1, tab2, tab3, tab4 = st.tabs(["Overall Profitability", "Revenue Analysis", "Cost Analysis", "Channel Comparison"])
 
         with tab1:
@@ -1269,7 +2196,6 @@ class DashboardRenderer:
             st.subheader("Profit Distribution")
             col1, col2 = st.columns(2)
 
-            # Left: keep the histogram as-is
             with col1:
                 fig = px.histogram(
                     self.df,
@@ -1280,7 +2206,6 @@ class DashboardRenderer:
                 fig.update_layout(bargap=0.1)
                 st.plotly_chart(fig, use_container_width=True)
 
-            # Right: Box by clean Registration labels
             with col2:
                 if 'kpmd_registered' in self.df.columns:
                     tmp = self._with_kpmd_status(self.df)
@@ -1295,6 +2220,19 @@ class DashboardRenderer:
                     )
                     fig.update_layout(legend_title_text='Registration')
                     st.plotly_chart(fig, use_container_width=True)
+
+            # ENHANCED: Add time series view for panel data
+            if self.dp.is_panel_data and 'panel_wave' in self.df.columns and selected_wave == "All periods":
+                st.subheader("Profit Trends Over Time")
+                
+                # Calculate profit by time period and KPMD status
+                profit_ts = self.df.groupby(['panel_wave', 'kpmd_registered'])['net_profit'].mean().reset_index()
+                profit_ts['KPMD Status'] = profit_ts['kpmd_registered'].map({1: 'KPMD', 0: 'Non-KPMD'})
+                
+                fig_ts = px.line(profit_ts, x='panel_wave', y='net_profit', color='KPMD Status',
+                               title='Average Net Profit Over Time',
+                               markers=True)
+                st.plotly_chart(fig_ts, use_container_width=True)
 
             if 'County' in self.df.columns:
                 st.subheader("Profitability by County")
@@ -1394,6 +2332,10 @@ class DashboardRenderer:
                 fig.update_traces(text=melted['Percentage'].round(1), textposition='outside')
                 fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                 st.plotly_chart(fig, use_container_width=True)
+                
+        # Restore original dataframe if we filtered it
+        if self.dp.is_panel_data and 'original_df' in locals():
+            self.df = original_df
 
     # ---------------- Field & Data Outlook ----------------
     def render_field_outlook(self):
@@ -1440,6 +2382,25 @@ class DashboardRenderer:
             else:
                 st.info("No time information available.")
 
+        # ENHANCED: Show panel data structure if available
+        if self.dp.is_panel_data:
+            st.subheader("Panel Data Overview")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Unique Households", self.df['panel_hhid'].nunique())
+            with col2:
+                st.metric("Time Periods", self.df['panel_wave'].nunique())
+            with col3:
+                obs_per_hh = self.df.groupby('panel_hhid').size()
+                st.metric("Avg Obs per HH", f"{obs_per_hh.mean():.1f}")
+            
+            # Show time period distribution
+            wave_dist = self.df['panel_wave'].value_counts().sort_index()
+            fig_wave = px.bar(x=wave_dist.index, y=wave_dist.values,
+                            title='Observations by Time Period',
+                            labels={'x': 'Time Period', 'y': 'Count'})
+            st.plotly_chart(fig_wave, use_container_width=True)
+
         st.subheader("Submissions by County and KPMD Status")
         if 'County' in self.df.columns and 'kpmd_registered' in self.df.columns:
             county_kpmd = self.df.groupby(['County','kpmd_registered']).size().reset_index(name='count')
@@ -1472,7 +2433,6 @@ class DashboardRenderer:
             lon_col = '_GPS Coordinates_longitude'
 
             if all(c in self.df.columns for c in (lat_col, lon_col)):
-                # 1) Points GDF
                 pts_df = self.df.dropna(subset=[lat_col, lon_col]).copy()
                 if len(pts_df) == 0:
                     st.info("No GPS points to map.")
@@ -1483,7 +2443,6 @@ class DashboardRenderer:
                         crs="EPSG:4326",
                     )
 
-                    # 2) Load county polygons (geoBoundaries)
                     counties_path = Path("geo/kenya_counties.geojson")
                     if not counties_path.exists():
                         st.warning("Missing geo/kenya_counties.geojson. Run:  py -3 scripts\\fetch_kenya_geo.py")
@@ -1491,7 +2450,6 @@ class DashboardRenderer:
                         gdf_counties = gpd.read_file(counties_path).to_crs("EPSG:4326")
                         name_col = "shapeName" if "shapeName" in gdf_counties.columns else gdf_counties.columns[0]
 
-                        # 3) Spatial join → farmer counts per county
                         joined = gpd.sjoin(
                             gdf_pts[["geometry"]],
                             gdf_counties[[name_col, "geometry"]],
@@ -1501,19 +2459,16 @@ class DashboardRenderer:
                         counts = joined.groupby(name_col).size().rename("farmers").reset_index()
                         gdf_counties = gdf_counties.merge(counts, on=name_col, how="left").fillna({"farmers": 0})
 
-                        # 4) Build colors (OrRd-ish ramp)
                         v = gdf_counties["farmers"].astype(float)
                         vmin, vmax = float(v.min()), float(v.max())
                         span = (vmax - vmin) if vmax > vmin else 1.0
                         t = (v - vmin) / span
-                        # start (very light) → end (dark red)
                         r0, g0, b0 = 254, 240, 217
                         r1, g1, b1 = 165,  15,  21
                         gdf_counties["r"] = (r0 + t * (r1 - r0)).round().clip(0,255).astype(int)
                         gdf_counties["g"] = (g0 + t * (g1 - g0)).round().clip(0,255).astype(int)
                         gdf_counties["b"] = (b0 + t * (b1 - b0)).round().clip(0,255).astype(int)
 
-                        # 5) Text anchor points for labels
                         reps = gdf_counties.representative_point()
                         gdf_labels = gpd.GeoDataFrame(
                             {
@@ -1527,8 +2482,6 @@ class DashboardRenderer:
                         )
                         gdf_labels["label"] = gdf_labels.apply(lambda r: f"{r['name']}\n{r['farmers']}", axis=1)
 
-                        # 6) Focus & layer controls (collapsed by default)
-                        max_count = int(vmax) if np.isfinite(vmax) else 0
                         with st.expander("Map focus & layers", expanded=False):
                             st.caption("Highlight areas with data")
                             focus_mode = st.radio(
@@ -1540,6 +2493,7 @@ class DashboardRenderer:
                                 key="map_focus_mode",
                             )
 
+                            max_count = int(vmax) if np.isfinite(vmax) else 0
                             if max_count > 0 and focus_mode != "Normal":
                                 threshold = st.slider(
                                     "Minimum # of farmers to focus",
@@ -1555,23 +2509,18 @@ class DashboardRenderer:
                             with c2:
                                 show_labels = st.checkbox("Show county labels", value=True, key="map_show_labels")
 
-                        # 7) Prepare polygons according to focus mode
                         gdf_c = gdf_counties.copy()
 
                         if focus_mode == "Hide areas below threshold" and max_count > 0:
                             gdf_c = gdf_c[gdf_c["farmers"] >= threshold].copy()
-                            # If everything got filtered out, fall back to original so we don't render a blank map
                             if gdf_c.empty:
                                 gdf_c = gdf_counties.copy()
-                            gdf_c["a"] = 220  # solid fill for what remains
+                            gdf_c["a"] = 220
                         elif focus_mode == "Dim areas below threshold" and max_count > 0:
-                            # Give high alpha (solid) to focused areas; dim the rest
                             gdf_c["a"] = np.where(gdf_c["farmers"] >= threshold, 220, 40).astype(int)
                         else:
-                            # Normal: uniform but still nicely visible
                             gdf_c["a"] = 180
 
-                        # 8) Labels built from the SAME set used for the polygons after filtering
                         reps = gdf_c.representative_point()
                         gdf_labels = gpd.GeoDataFrame(
                             {
@@ -1585,10 +2534,8 @@ class DashboardRenderer:
                         )
                         gdf_labels["label"] = gdf_labels.apply(lambda r: f"{r['name']}\n{r['farmers']}", axis=1)
 
-                        # 9) Build layers
                         layers = []
 
-                        # Choropleth polygons (use per-feature alpha 'a'; colors already computed)
                         counties_geojson = json.loads(gdf_c.to_json())
                         layers.append(
                             pdk.Layer(
@@ -1603,7 +2550,6 @@ class DashboardRenderer:
                             )
                         )
 
-                        # Labels (optional)
                         if show_labels and not gdf_labels.empty:
                             layers.append(
                                 pdk.Layer(
@@ -1618,7 +2564,6 @@ class DashboardRenderer:
                                 )
                             )
 
-                        # Household points (optional)
                         if show_points and not gdf_pts.empty:
                             has_kpmd = "kpmd_registered" in gdf_pts.columns
                             data_pts = gdf_pts.assign(
@@ -1639,13 +2584,11 @@ class DashboardRenderer:
                                 )
                             )
 
-                        # 10) Kenya-centric view — fit to the possibly filtered polygons to reinforce the focus
-                        bounds = gdf_c.total_bounds  # [minx, miny, maxx, maxy]
+                        bounds = gdf_c.total_bounds
                         cx = float((bounds[0] + bounds[2]) / 2)
                         cy = float((bounds[1] + bounds[3]) / 2)
                         view_state = pdk.ViewState(latitude=cy, longitude=cx, zoom=5.6, pitch=0, bearing=0)
 
-                        # 11) Render
                         st.pydeck_chart(
                             pdk.Deck(
                                 map_style="mapbox://styles/mapbox/light-v9",
@@ -1654,8 +2597,6 @@ class DashboardRenderer:
                                 tooltip={"text": "{name}\nFarmers: {farmers}"},
                             )
                         )
-
-    # paste this INSIDE class DashboardRenderer: (same level as your other render_* methods)
 
     # ---------------- Pastoral Productivity ----------------
     def render_pastoral_productivity(self):
@@ -2988,7 +3929,6 @@ def main():
             st.warning("Base maps unavailable — county/sub-county outlines will be hidden.")
 
         with st.expander("Data Preview", expanded=False):
-
             st.write(f"Columns detected ({len(df.columns)}):")
             st.write(list(df.columns))
             st.write(f"Total records: {len(df)}")
@@ -3003,8 +3943,7 @@ def main():
 
         # ---------- Sidebar: FILTERS ----------
         st.sidebar.header("Global Filters")
-        # (kept exactly as before – “Select Here” expander + cascading filters)
-
+        
         # --- Helper: compute date bounds from the CURRENT (unfiltered) df ---
         def _compute_date_bounds(df_for_bounds: pd.DataFrame):
             for cand in ['int_date_std', '_submission_time', 'start', 'end']:
@@ -3137,7 +4076,7 @@ def main():
             unsafe_allow_html=True
         )
 
-        # Main pages list (P&L Analysis is intentionally NOT included here)
+        # Main pages list - ADDED "Panel Analysis"
         MAIN_PAGES = [
             "Field Outlook",
             "Pastoral Productivity",
@@ -3151,6 +4090,7 @@ def main():
             "Climate Impact",
             "KPMD Participation",
             "Food Security (rCSI – 30d)",
+            "Panel Analysis"  # NEW: Panel Data Analysis
         ]
 
         # Defaults
@@ -3159,7 +4099,7 @@ def main():
         if "nav_page_radio" not in st.session_state:
             st.session_state["nav_page_radio"] = "Field Outlook"
 
-        # Radio for the standard pages (excludes P&L Analysis)
+        # Radio for the standard pages
         selected_from_radio = st.sidebar.radio(
             "Select Dashboard Page",
             MAIN_PAGES,
@@ -3170,7 +4110,7 @@ def main():
         if st.session_state.get("nav_page") != "P&L Analysis":
             st.session_state["nav_page"] = selected_from_radio
 
-        # Separate, top-level entry for P&L Analysis (same level as the radio label)
+        # Separate, top-level entry for P&L Analysis
         st.sidebar.markdown("---")
         st.sidebar.markdown("### 💰 P&L Analysis")
         if st.sidebar.button("Open P&L Analysis", use_container_width=True):
@@ -3211,6 +4151,8 @@ def main():
             renderer.render_food_security()
         elif page == "P&L Analysis":
             renderer.render_pl_analysis()
+        elif page == "Panel Analysis":  # NEW: Panel Data Analysis
+            renderer.render_panel_analysis()
 
     except FileNotFoundError:
         st.error("The specified data file was not found.")
