@@ -1,0 +1,89 @@
+/* apmt_dashboard/assets/style.css */
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+
+.main-header {
+    font-size: 2.5rem;
+    color: #1f77b4;
+    text-align: center;
+    margin-bottom: 2rem;
+}
+
+.metric-card {
+    background-color: #f0f2f6;
+    padding: 1rem;
+    border-radius: 10px;
+    border-left: 4px solid #1f77b4;
+    margin: 0.5rem 0;
+}
+
+.kpmd-card { 
+    background-color: #e8f4fd; 
+    border-left: 4px solid #1f77b4; 
+}
+
+.non-kpmd-card { 
+    background-color: #fde8e8; 
+    border-left: 4px solid #ff6b6b; 
+}
+
+.warning-card { 
+    background-color: #fff3cd; 
+    padding: 1rem; 
+    border-radius: 10px; 
+    border-left: 4px solid #ffc107; 
+}
+
+.profit-positive { 
+    color: #28a745; 
+    font-weight: bold; 
+}
+
+.profit-negative { 
+    color: #dc3545; 
+    font-weight: bold; 
+}
+
+.lsm-note { 
+    font-size: 0.85rem; 
+    color: #555; 
+    margin-top: 0.25rem; 
+}
+
+.panel-wave { 
+    color: #6f42c1; 
+    font-weight: bold; 
+}
+
+.did-estimate { 
+    background-color: #e8f5e8; 
+    padding: 10px; 
+    border-radius: 5px; 
+    border-left: 4px solid #28a745; 
+}
+
+/* Panel data specific styles */
+.panel-summary {
+    background-color: #f8f9fa;
+    padding: 1rem;
+    border-radius: 10px;
+    border-left: 4px solid #6f42c1;
+    margin: 1rem 0;
+}
+
+.attrition-high {
+    color: #dc3545;
+    font-weight: bold;
+}
+
+.attrition-low {
+    color: #28a745;
+    font-weight: bold;
+}
+
+/* Chart improvements */
+.plotly-graph-div {
+    border-radius: 10px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
