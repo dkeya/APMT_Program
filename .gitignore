@@ -1,0 +1,5 @@
+﻿.venv/
+__pycache__/
+*.pyc
+requirements.backup_*.txt
+.DS_Store
