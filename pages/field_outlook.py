@@ -83,8 +83,6 @@ def render_field_outlook(processor):
             "Latest Submission",
             latest.strftime("%Y-%m-%d") if (latest is not None and pd.notna(latest)) else "N/A"
         )
-        if best_col:
-            st.caption(f"Using date field: **{best_col}**")
 
     with col3:
         counties_covered = int(df["County"].nunique()) if "County" in df.columns else 0
