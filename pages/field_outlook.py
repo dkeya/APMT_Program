@@ -73,7 +73,7 @@ def render_field_outlook(processor):
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-        st.metric("Total Records (Rows)", len(df))
+        st.metric("Total Submissions", f"{len(df):,}")
 
     with col2:
         best_col, parsed = _best_date_column(df)
